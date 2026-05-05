@@ -29,6 +29,7 @@ import { storage } from './storage';
 import { appendFileSync } from 'node:fs';
 import {
   generateBracketedLineups,
+  findBalancedTeams,
   buildRestStatesFromHistory,
   buildPartnerHistoryFromHistory,
   loadRestStatesFromDb,
@@ -36,6 +37,7 @@ import {
   getSittingOutPlayers,
   computeRecentPartnersAndOpponents,
 } from './matchmaking';
+import type { Player } from '@shared/schema';
 import {
   matchSuggestions,
   matchSuggestionPlayers,
@@ -314,6 +316,80 @@ function pickStandardLineup(
   return { team1Ids, team2Ids };
 }
 
+// Build a 2v2 lineup that MUST contain every id in `mustIncludeIds`,
+// padding the rest from `fillFromIds`. Used by the queued-orchestrator's
+// Case 2/3 path: when only 1-3 players are waiting, the missing slots are
+// filled with the court's currently-playing roster. We try every
+// C(fillFromIds, 4 - mustIncludeIds.length) subset, evaluate the 3 team
+// permutations of each resulting 4-player set via findBalancedTeams, and
+// keep the best (skillGap → splitPenalty → variance — same key as the
+// standard generator).
+function pickLineupWithMustInclude(
+  sessionId: string,
+  mustIncludeIds: string[],
+  fillFromIds: string[],
+  allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
+): Lineup | null {
+  const need = 4 - mustIncludeIds.length;
+  if (need <= 0 || need > fillFromIds.length) return null;
+
+  const playersById = new Map(allPlayers.map(p => [p.id, p]));
+  const mustInclude: Player[] = [];
+  for (const id of mustIncludeIds) {
+    const p = playersById.get(id);
+    if (!p) return null;
+    mustInclude.push(p);
+  }
+  const fillCandidates: Player[] = [];
+  for (const id of fillFromIds) {
+    const p = playersById.get(id);
+    if (p) fillCandidates.push(p);
+  }
+  if (fillCandidates.length < need) return null;
+
+  // Enumerate C(fillCandidates, need) subsets.
+  const combos: Player[][] = [];
+  const pick = (start: number, chosen: Player[]) => {
+    if (chosen.length === need) {
+      combos.push(chosen.slice());
+      return;
+    }
+    for (let i = start; i < fillCandidates.length; i++) {
+      chosen.push(fillCandidates[i]);
+      pick(i + 1, chosen);
+      chosen.pop();
+    }
+  };
+  pick(0, []);
+
+  let best: { team1Ids: string[]; team2Ids: string[]; skillGap: number; splitPenalty: number; variance: number } | null = null;
+  for (const fillCombo of combos) {
+    const four = [...mustInclude, ...fillCombo];
+    const ranked = findBalancedTeams(four, 1, false, sessionId);
+    const top = ranked[0];
+    if (!top) continue;
+    const candidate = {
+      team1Ids: top.team1.map(p => p.id),
+      team2Ids: top.team2.map(p => p.id),
+      skillGap: top.skillGap,
+      splitPenalty: top.splitPenalty,
+      variance: top.variance,
+    };
+    if (!best) {
+      best = candidate;
+      continue;
+    }
+    const beats =
+      candidate.skillGap < best.skillGap - 0.01 ||
+      (Math.abs(candidate.skillGap - best.skillGap) < 0.01 && candidate.splitPenalty < best.splitPenalty) ||
+      (Math.abs(candidate.skillGap - best.skillGap) < 0.01 && candidate.splitPenalty === best.splitPenalty && candidate.variance < best.variance);
+    if (beats) best = candidate;
+  }
+
+  if (!best) return null;
+  return { team1Ids: best.team1Ids, team2Ids: best.team2Ids };
+}
+
 export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
   try {
     await withSessionLock(sessionId, async () => {
@@ -435,15 +511,17 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
 
       // Second pass: queued orchestrator. For every court currently in
       // 'playing' status that does not already have a 'queued' next-round
-      // lineup, build one from the waiting pool so the Court Captain
-      // panel can show "Up next" and the next-round transition is
-      // instantaneous when the score is submitted.
+      // lineup, build one so the Court Captain panel can show "Up next"
+      // and the next-round transition is instantaneous when the score is
+      // submitted.
       //
-      // Case 1 only (pure waiting pool). Case 2/3 (mixing in active
-      // players currently on the court) is intentionally skipped for
-      // this iteration — the game-end transition handles "no queued
-      // exists" gracefully by falling through to the regular pending
-      // path via tryAutoMatchmaking.
+      // Handles Case 1 (pool >= 4 → pure waiting players) and Case 2/3
+      // (pool 1-3 → mix in this court's currently-playing roster). When
+      // Case 2/3 is used the row is created with includesActivePlayers
+      // = true so the game-end transition re-verifies availability
+      // before flipping queued → pending; on failure it dismisses the
+      // queued row and the regular pending path via tryAutoMatchmaking
+      // takes over.
       try {
         await runQueuedOrchestrator(sessionId, allPlayers);
       } catch (orchErr) {
@@ -476,32 +554,33 @@ async function runQueuedOrchestrator(
   if (courtsNeedingQueued.length === 0) return;
 
   // Pool: queue minus sitting-out minus anyone already on a non-terminal
-  // suggestion (pending|approved|playing|queued).
+  // suggestion (pending|approved|playing|queued). May be < 4 — Case 2/3
+  // below handles 1-3 by mixing in the court's currently-playing roster.
   const onAnyOpen = await getPlayersOnAnyOpenSuggestion(sessionId);
   const sittingOut = new Set(getSittingOutPlayers(sessionId));
   const queue = await storage.getQueue(sessionId);
   let pool = queue.filter(id => !sittingOut.has(id) && !onAnyOpen.has(id));
 
-  if (pool.length < 4) {
-    console.log(`[queued-orchestrator] session=${sessionId} skipped — pool=${pool.length} < 4`);
+  if (pool.length === 0) {
+    console.log(`[queued-orchestrator] session=${sessionId} skipped — pool=0 (no waiting players for any case)`);
     return;
   }
 
+  // Tracks which courts have a queued lineup created this run, so each
+  // subsequent pass (Claude → standard pure-pool → mixed pool) only
+  // touches courts still missing one.
+  const filledCourtIds = new Set<string>();
+
+  // ── Case 1 (pure waiting pool) ──────────────────────────────────────────
   // Multi-court Claude path. Only used when 2+ courts need queued AND we
   // have enough players to fill at least 2 lineups (8 players).
   const useClaude = courtsNeedingQueued.length >= 2 && pool.length >= 8 && !!process.env.ANTHROPIC_API_KEY;
 
-  // Court IDs Claude has already filled this run, so the standard
-  // generator below skips them. Anything Claude couldn't fill (parse
-  // error, partial response, dupe player rejected) falls through to the
-  // standard generator for that specific court — never silently
-  // skipped.
   let createdClaude = 0;
-  let claudeFilledCourtIds = new Set<string>();
   if (useClaude) {
     const result = await tryClaudeQueuedBatch(sessionId, courtsNeedingQueued, pool, allPlayers);
     createdClaude = result.created;
-    claudeFilledCourtIds = result.filledCourtIds;
+    result.filledCourtIds.forEach(id => filledCourtIds.add(id));
     if (result.usedPlayerIds.size > 0) {
       pool = pool.filter(id => !result.usedPlayerIds.has(id));
     }
@@ -510,11 +589,11 @@ async function runQueuedOrchestrator(
     }
   }
 
-  // Standard generator path: covers single-court runs, Claude-skipped
+  // Standard pure-pool generator: covers single-court runs, Claude-skipped
   // runs, AND any courts Claude couldn't fill in a partial response.
   let createdStd = 0;
   for (const court of courtsNeedingQueued) {
-    if (claudeFilledCourtIds.has(court.id)) continue;
+    if (filledCourtIds.has(court.id)) continue;
     if (pool.length < 4) break;
     const lineup = pickStandardLineup(sessionId, pool, allPlayers);
     if (!lineup) break;
@@ -531,6 +610,7 @@ async function runQueuedOrchestrator(
         ],
       });
       createdStd++;
+      filledCourtIds.add(court.id);
       const usedIds = new Set([...lineup.team1Ids, ...lineup.team2Ids]);
       pool = pool.filter(id => !usedIds.has(id));
     } catch (createErr) {
@@ -539,6 +619,52 @@ async function runQueuedOrchestrator(
   }
   if (createdStd > 0) {
     console.log(`[queued-orchestrator] session=${sessionId} created ${createdStd} queued lineup(s) via standard generator`);
+  }
+
+  // ── Case 2/3 (waiting pool 1-3 → mix in this court's active players) ───
+  // For each remaining court, force-include every still-waiting player
+  // and fill the remaining slots from THAT court's currently-playing
+  // roster. The waiting pool is shared across courts so we drain it as
+  // we go; active rosters are per-court so they aren't tracked across
+  // iterations. includesActivePlayers=true so the game-end transition
+  // re-verifies eligibility before flipping queued→pending.
+  let createdMixed = 0;
+  for (const court of courtsNeedingQueued) {
+    if (filledCourtIds.has(court.id)) continue;
+    if (pool.length === 0 || pool.length >= 4) continue;
+
+    const courtPlayerIds = await storage.getCourtPlayers(court.id);
+    if (courtPlayerIds.length < 4 - pool.length) continue;
+
+    const lineup = pickLineupWithMustInclude(sessionId, pool, courtPlayerIds, allPlayers);
+    if (!lineup) continue;
+
+    try {
+      await storage.createMatchSuggestion({
+        sessionId,
+        courtId: court.id,
+        pendingUntil: null,
+        status: 'queued',
+        includesActivePlayers: true,
+        players: [
+          ...lineup.team1Ids.map(id => ({ playerId: id, team: 1 as const })),
+          ...lineup.team2Ids.map(id => ({ playerId: id, team: 2 as const })),
+        ],
+      });
+      createdMixed++;
+      filledCourtIds.add(court.id);
+      // Drain ONLY the waiting players from the shared pool. The active
+      // court players we mixed in are not in the pool to begin with.
+      const waitingSet = new Set(pool);
+      const lineupIds = [...lineup.team1Ids, ...lineup.team2Ids];
+      const consumedWaiting = new Set(lineupIds.filter(id => waitingSet.has(id)));
+      pool = pool.filter(id => !consumedWaiting.has(id));
+    } catch (createErr) {
+      console.error(`[queued-orchestrator] session=${sessionId} court=${court.id} mixed-pool create failed:`, createErr);
+    }
+  }
+  if (createdMixed > 0) {
+    console.log(`[queued-orchestrator] session=${sessionId} created ${createdMixed} queued lineup(s) via mixed-pool generator (Case 2/3, includesActivePlayers=true)`);
   }
 }
 
