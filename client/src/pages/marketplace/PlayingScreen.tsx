@@ -167,7 +167,7 @@ function PlayingContent({
               style={{ color: NAVY }}
               data-testid="text-court-name"
             >
-              {suggestion.courtName}
+              {suggestion.courtName?.trim() || '—'}
             </p>
           </div>
 
