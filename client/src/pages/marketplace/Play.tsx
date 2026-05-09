@@ -353,14 +353,14 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
 
   const suggestion = suggestionQuery.data?.suggestion ?? null;
 
-  // Court-ready alert: chime + vibrate + title rewrite on pending → approved.
-  // Tracked across renders via ref so we only fire once per transition.
+  // Court-ready alert: chime + vibrate + title rewrite + in-page banner on
+  // pending → approved. Tracked across renders via ref so we only fire
+  // once per transition.
   const lastStatusRef = useRef<string | null>(null);
+  const [showCourtReadyBanner, setShowCourtReadyBanner] = useState(false);
   useEffect(() => {
     const status = suggestion?.status ?? null;
     const prev = lastStatusRef.current;
-    // Update the ref AFTER the transition check, otherwise prev === status
-    // on the very render that flipped the status, and the alert never fires.
     if (prev !== 'approved' && status === 'approved') {
       lastStatusRef.current = status;
       try { playChime(); } catch {}
@@ -368,13 +368,23 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
       const courtName = suggestion?.courtName || 'your court';
       const originalTitle = document.title;
       document.title = `Court ready — ${courtName}`;
-      const restore = window.setTimeout(() => {
+      setShowCourtReadyBanner(true);
+      const restoreTitle = window.setTimeout(() => {
         document.title = originalTitle;
       }, 30_000);
-      return () => window.clearTimeout(restore);
+      const hideBanner = window.setTimeout(() => {
+        setShowCourtReadyBanner(false);
+      }, 12_000);
+      return () => {
+        window.clearTimeout(restoreTitle);
+        window.clearTimeout(hideBanner);
+      };
+    }
+    if (status !== 'approved' && showCourtReadyBanner) {
+      setShowCourtReadyBanner(false);
     }
     lastStatusRef.current = status;
-  }, [suggestion?.status, suggestion?.courtName]);
+  }, [suggestion?.status, suggestion?.courtName, showCourtReadyBanner]);
 
   useEffect(() => {
     if (suggestion?.status === 'playing') {
@@ -426,7 +436,14 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
         </h1>
       </div>
 
+      <CourtReadyBanner
+        visible={showCourtReadyBanner}
+        courtName={suggestion?.courtName ?? ''}
+      />
+
       <WaitingChips stats={stats} />
+
+      <EtaHint stats={stats} />
 
       <CourtsInPlayStrip courts={stats?.courtsInPlay ?? []} />
 
@@ -484,17 +501,20 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
 }
 
 function WaitingChips({ stats }: { stats: TodayStatsResponse | undefined }) {
-  // Useful at-a-glance info: queue position, courts currently in play, and
-  // games already played today. Replaces the duplicated games/wins/tier
-  // chips that overlap with the stats already on /marketplace/dashboard.
+  // Three at-a-glance chips per the task spec: queue position, courts
+  // currently in play, and the player's last game outcome. The last-game
+  // chip is intentionally compact (W/L + score) — the full opponent
+  // detail is available below in the stand-alone last-game card.
   const queueLabel =
     stats?.queuePosition == null ? '—' : `#${stats.queuePosition}`;
   const courtsBusy = stats?.courtsInPlay.length ?? 0;
-  const courtsTotal = courtsBusy; // we only know the busy count from this endpoint
-  const items: Array<{ icon: typeof ListOrdered; label: string; value: string; testId: string }> = [
+  const last = stats?.lastGame ?? null;
+  const lastLabel = last ? `${last.won ? 'W' : 'L'} ${last.myScore}–${last.theirScore}` : '—';
+  const lastColor = last ? (last.won ? TEAL : NAVY) : NAVY;
+  const items: Array<{ icon: typeof ListOrdered; label: string; value: string; testId: string; valueColor?: string }> = [
     { icon: ListOrdered, label: 'Queue', value: queueLabel, testId: 'stat-queue-position' },
-    { icon: Users, label: 'Courts in play', value: courtsTotal === 0 ? '0' : String(courtsBusy), testId: 'stat-courts-in-play' },
-    { icon: Trophy, label: 'Games today', value: String(stats?.gamesPlayed ?? '—'), testId: 'stat-games-today' },
+    { icon: Users, label: 'Courts in play', value: String(courtsBusy), testId: 'stat-courts-in-play' },
+    { icon: Trophy, label: 'Last game', value: lastLabel, testId: 'stat-last-game', valueColor: lastColor },
   ];
   return (
     <div className="grid grid-cols-3 gap-2" data-testid="row-stat-chips">
@@ -507,7 +527,7 @@ function WaitingChips({ stats }: { stats: TodayStatsResponse | undefined }) {
             data-testid={item.testId}
           >
             <Icon className="h-4 w-4 text-muted-foreground" />
-            <span className="text-lg font-semibold" style={{ color: NAVY }}>
+            <span className="text-lg font-semibold" style={{ color: item.valueColor ?? NAVY }}>
               {item.value}
             </span>
             <span className="text-[10px] uppercase tracking-wider text-muted-foreground text-center">
@@ -516,6 +536,61 @@ function WaitingChips({ stats }: { stats: TodayStatsResponse | undefined }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function EtaHint({ stats }: { stats: TodayStatsResponse | undefined }) {
+  // Coarse ETA: assumes ~12 minutes per game per court. With no queue
+  // position or no busy courts, we can't say anything useful — render
+  // nothing rather than guess. Renders a fixed-height row regardless
+  // of state so the page doesn't shift when the ETA appears/disappears.
+  const minutes = useMemo(() => {
+    if (!stats || stats.queuePosition == null) return null;
+    const courts = stats.courtsInPlay.length;
+    if (courts <= 0) return null;
+    // Players ahead of us / lineup-of-4 = number of games we wait through.
+    const gamesAhead = Math.max(0, stats.queuePosition - 1);
+    const waves = Math.ceil((gamesAhead + 1) / Math.max(courts, 1));
+    return Math.max(0, waves * 12);
+  }, [stats]);
+  return (
+    <p
+      className="text-xs text-center text-muted-foreground h-4"
+      data-testid="text-eta-hint"
+    >
+      {minutes == null
+        ? ''
+        : minutes <= 0
+          ? 'You should be up next.'
+          : `Roughly ${minutes} min until your next game.`}
+    </p>
+  );
+}
+
+function CourtReadyBanner({ visible, courtName }: { visible: boolean; courtName: string }) {
+  // Reserved-height banner so the layout never shifts when it appears.
+  // Hidden via visibility (not display) per the universal guideline that
+  // visibility shouldn't trigger layout changes on transitions.
+  return (
+    <div
+      className="rounded-md border-2 px-4 py-3 text-center transition-opacity duration-300"
+      style={{
+        borderColor: TEAL,
+        backgroundColor: '#F5EFE0',
+        visibility: visible ? 'visible' : 'hidden',
+        opacity: visible ? 1 : 0,
+      }}
+      role={visible ? 'alert' : undefined}
+      aria-live="assertive"
+      data-testid="banner-court-ready"
+    >
+      <p className="text-xs uppercase tracking-wider" style={{ color: TEAL }}>
+        Court ready
+      </p>
+      <p className="text-base font-semibold" style={{ color: NAVY }}>
+        Head to Court {courtName || '—'}
+      </p>
     </div>
   );
 }
@@ -894,8 +969,15 @@ function formatElapsed(totalSeconds: number): string {
 
 // Soft court-ready chime built with Web Audio so we don't ship an audio asset.
 // Two short sine tones — quiet enough to be a notification, not a startle.
+type AudioContextCtor = typeof AudioContext;
+interface AudioContextWindow extends Window {
+  AudioContext?: AudioContextCtor;
+  webkitAudioContext?: AudioContextCtor;
+}
+
 function playChime(): void {
-  const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+  const w = window as AudioContextWindow;
+  const Ctx: AudioContextCtor | undefined = w.AudioContext ?? w.webkitAudioContext;
   if (!Ctx) return;
   const ctx = new Ctx();
   const note = (freq: number, start: number, duration: number) => {
