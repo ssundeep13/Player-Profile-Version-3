@@ -522,7 +522,7 @@ function WaitingChips({ stats }: { stats: TodayStatsResponse | undefined }) {
   // detail is available below in the stand-alone last-game card.
   const queueLabel =
     stats?.queuePosition == null ? '—' : `#${stats.queuePosition}`;
-  const courtsBusy = stats?.courtsInPlay.length ?? 0;
+  const courtsBusy = stats?.courtsInPlay?.length ?? 0;
   const last = stats?.lastGame ?? null;
   const lastLabel = last ? `${last.won ? 'W' : 'L'} ${last.myScore}–${last.theirScore}` : '—';
   const lastColor = last ? (last.won ? TEAL : NAVY) : NAVY;
@@ -562,7 +562,7 @@ function EtaHint({ stats }: { stats: TodayStatsResponse | undefined }) {
   // of state so the page doesn't shift when the ETA appears/disappears.
   const minutes = useMemo(() => {
     if (!stats || stats.queuePosition == null) return null;
-    const courts = stats.courtsInPlay.length;
+    const courts = stats.courtsInPlay?.length ?? 0;
     if (courts <= 0) return null;
     // Queue position is player-based; each game consumes 4 players.
     // 1) playersAhead → gamesAhead (groups of 4)

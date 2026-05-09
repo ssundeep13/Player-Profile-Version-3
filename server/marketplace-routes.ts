@@ -3644,17 +3644,32 @@ export function registerMarketplaceRoutes(app: Express) {
         const skillScore = player?.skillScore ?? 0;
         const tierName = player ? tierDisplayName(player.level) : '';
 
+        // Stable response shape: every code path returns the same keys
+        // (queuePosition, courtsInPlay, lastGame) so the client can read
+        // them defensively without optional-chaining each field.
         if (!linkedPlayerId) {
-          return res.json({ gamesPlayed: 0, wins: 0, skillScore, tierName });
+          return res.json({
+            gamesPlayed: 0,
+            wins: 0,
+            skillScore,
+            tierName,
+            queuePosition: null,
+            courtsInPlay: [],
+            lastGame: null,
+          });
         }
 
         const activeSession = await storage.getActiveSession();
         if (!activeSession) {
-          // No active session — the in-session counters are zero, but
-          // the player's lifetime skill + tier still surface so the
-          // chips don't render as "—" when the player is just waiting
-          // between sessions.
-          return res.json({ gamesPlayed: 0, wins: 0, skillScore, tierName });
+          return res.json({
+            gamesPlayed: 0,
+            wins: 0,
+            skillScore,
+            tierName,
+            queuePosition: null,
+            courtsInPlay: [],
+            lastGame: null,
+          });
         }
 
         const gpRows = await db
