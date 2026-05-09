@@ -4663,6 +4663,27 @@ export function registerMarketplaceRoutes(app: Express) {
         //     Return success without touching court / queue / rest states —
         //     those were already updated by the winning submission's caller.
         if (txResult.alreadySubmitted) {
+          // Idempotent legacy-cleanup recovery. The non-idempotent
+          // side effects (rest states, partner history, queue rebuild)
+          // are correctly skipped — they would double-count. But the
+          // court reset IS idempotent (already-available court +
+          // already-empty court_players are no-ops), so re-running it
+          // here recovers from the partial-write window where the
+          // winning tx committed but the route handler crashed before
+          // resetting legacy court state. Without this, retries hit
+          // alreadySubmitted and admin would see a phantom-occupied
+          // court forever.
+          try {
+            await storage.updateCourt(court.id, {
+              status: 'available',
+              timeRemaining: 0,
+              winningTeam: null,
+              startedAt: null,
+            });
+            await storage.setCourtPlayers(court.id, []);
+          } catch (recoveryErr) {
+            console.error('[submit-score] alreadySubmitted legacy-recovery failed:', recoveryErr);
+          }
           return res.json({
             success: true,
             gameResultId: txResult.gameId,
