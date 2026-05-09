@@ -374,9 +374,10 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
     if (prev !== 'approved' && status === 'approved') {
       try { playChime(); } catch {}
       try { navigator.vibrate?.([200, 100, 200]); } catch {}
-      const courtName = suggestion?.courtName || 'your court';
+      const courtRaw = stripCourtPrefix(suggestion?.courtName);
+      const courtLabel = courtRaw ? `Court ${courtRaw}` : 'your court';
       const originalTitle = document.title;
-      document.title = `Court ready — ${courtName}`;
+      document.title = `Court ready — ${courtLabel}`;
       setShowCourtReadyBanner(true);
       const restoreTitle = window.setTimeout(() => {
         document.title = originalTitle;
@@ -603,7 +604,7 @@ function CourtReadyBanner({ visible, courtName }: { visible: boolean; courtName:
         Court ready
       </p>
       <p className="text-base font-semibold" style={{ color: NAVY }}>
-        Head to Court {courtName || '—'}
+        Head to Court {stripCourtPrefix(courtName) || '—'}
       </p>
     </div>
   );
@@ -694,7 +695,7 @@ function OnDeckCard({ suggestion }: { suggestion: CurrentSuggestion }) {
               <>
                 You're up next on{' '}
                 <span style={{ color: TEAL }} data-testid="text-on-deck-court-name">
-                  Court {suggestion.courtName}
+                  Court {stripCourtPrefix(suggestion.courtName)}
                 </span>
               </>
             ) : (
@@ -801,7 +802,7 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
                 <h2 className="text-lg font-semibold leading-tight" data-testid="text-game-heading">
                   Head to{' '}
                   <span style={{ color: TEAL }} data-testid="text-court-name-approved">
-                    Court {suggestion.courtName}
+                    Court {stripCourtPrefix(suggestion.courtName)}
                   </span>{' '}
                   now
                 </h2>
@@ -816,7 +817,7 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
                 Your next game
               </h2>
               <p className="text-sm text-muted-foreground" data-testid="text-court-name-pending">
-                Court {suggestion.courtName}
+                Court {stripCourtPrefix(suggestion.courtName)}
               </p>
             </div>
           )}
@@ -857,7 +858,16 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
   );
 }
 
+// Strip a leading "Court " prefix from server-supplied court names so we
+// don't end up rendering "Court Court 1" in places where our UI already
+// supplies the "Court" label (badges, "Head to Court X", etc.).
+function stripCourtPrefix(name: string | null | undefined): string {
+  const trimmed = (name ?? '').trim();
+  return trimmed.replace(/^court\s+/i, '');
+}
+
 function CourtBadge({ name }: { name: string }) {
+  const display = stripCourtPrefix(name);
   return (
     <div
       className="h-16 w-16 shrink-0 rounded-md border-2 flex flex-col items-center justify-center"
@@ -868,7 +878,7 @@ function CourtBadge({ name }: { name: string }) {
         Court
       </span>
       <span className="text-2xl font-bold leading-none" style={{ color: NAVY }}>
-        {name?.trim() || '—'}
+        {display || '—'}
       </span>
     </div>
   );
@@ -936,9 +946,13 @@ function TeamRow({
               <div className="flex-1 min-w-0">
                 <p className="text-base font-medium leading-tight truncate">{p.playerName}</p>
                 {p.tierName ? (
-                  <p className="text-xs text-muted-foreground leading-tight" data-testid={`text-player-tier-${p.playerId}`}>
+                  <Badge
+                    variant="secondary"
+                    className="mt-0.5 text-[10px] uppercase tracking-wider"
+                    data-testid={`badge-player-tier-${p.playerId}`}
+                  >
                     {p.tierName}
-                  </p>
+                  </Badge>
                 ) : null}
               </div>
             </div>

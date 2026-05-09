@@ -5,6 +5,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -219,6 +220,9 @@ function PlayingContent({ suggestion }: { suggestion: CurrentSuggestion }) {
 }
 
 function CourtBadge({ name }: { name: string }) {
+  // Server names sometimes already include a "Court " prefix. Strip it
+  // so the visual badge doesn't read "Court Court 1".
+  const display = (name ?? '').trim().replace(/^court\s+/i, '');
   return (
     <div
       className="h-20 w-20 shrink-0 rounded-md border-2 flex flex-col items-center justify-center"
@@ -229,7 +233,7 @@ function CourtBadge({ name }: { name: string }) {
         Court
       </span>
       <span className="text-3xl font-bold leading-none" style={{ color: NAVY }} data-testid="text-court-name">
-        {name?.trim() || '—'}
+        {display || '—'}
       </span>
     </div>
   );
@@ -268,9 +272,13 @@ function TeamRow({
               <div className="flex-1 min-w-0">
                 <p className="text-base font-medium leading-tight truncate">{p.playerName}</p>
                 {p.tierName ? (
-                  <p className="text-xs text-muted-foreground leading-tight">
+                  <Badge
+                    variant="secondary"
+                    className="mt-0.5 text-[10px] uppercase tracking-wider"
+                    data-testid={`badge-player-tier-${p.playerId}`}
+                  >
                     {p.tierName}
-                  </p>
+                  </Badge>
                 ) : null}
               </div>
             </div>
