@@ -564,9 +564,13 @@ function EtaHint({ stats }: { stats: TodayStatsResponse | undefined }) {
     if (!stats || stats.queuePosition == null) return null;
     const courts = stats.courtsInPlay.length;
     if (courts <= 0) return null;
-    // Players ahead of us / lineup-of-4 = number of games we wait through.
-    const gamesAhead = Math.max(0, stats.queuePosition - 1);
-    const waves = Math.ceil((gamesAhead + 1) / Math.max(courts, 1));
+    // Queue position is player-based; each game consumes 4 players.
+    // 1) playersAhead → gamesAhead (groups of 4)
+    // 2) gamesAhead distributed over parallel courts → waves to wait
+    // 3) each wave ≈ 12 minutes
+    const playersAhead = Math.max(0, stats.queuePosition - 1);
+    const gamesAhead = Math.ceil(playersAhead / 4);
+    const waves = Math.ceil(gamesAhead / Math.max(courts, 1));
     return Math.max(0, waves * 12);
   }, [stats]);
   return (
