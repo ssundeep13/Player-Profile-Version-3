@@ -4663,24 +4663,32 @@ export function registerMarketplaceRoutes(app: Express) {
         //     Return success without touching court / queue / rest states —
         //     those were already updated by the winning submission's caller.
         if (txResult.alreadySubmitted) {
-          // Idempotent legacy-cleanup recovery. The non-idempotent
-          // side effects (rest states, partner history, queue rebuild)
-          // are correctly skipped — they would double-count. But the
-          // court reset IS idempotent (already-available court +
-          // already-empty court_players are no-ops), so re-running it
-          // here recovers from the partial-write window where the
-          // winning tx committed but the route handler crashed before
-          // resetting legacy court state. Without this, retries hit
-          // alreadySubmitted and admin would see a phantom-occupied
-          // court forever.
+          // Idempotent legacy-cleanup recovery — STRICTLY GUARDED.
+          // Submit-score allows replays for already-'completed'
+          // suggestions, so a delayed retry for an OLD game could
+          // arrive after the same court has already moved on to a
+          // newer 'playing' lineup. Wiping legacy court state in
+          // that case would clobber the live game and create the
+          // very split-brain we're closing. Only run the reset when
+          // the court has NO active suggestion at all, or when its
+          // active suggestion is THIS very one (i.e. the partial-
+          // write window we want to recover). Non-idempotent side
+          // effects (rest states, partner history, queue rebuild)
+          // remain correctly skipped — they would double-count.
           try {
-            await storage.updateCourt(court.id, {
-              status: 'available',
-              timeRemaining: 0,
-              winningTeam: null,
-              startedAt: null,
-            });
-            await storage.setCourtPlayers(court.id, []);
+            const liveOnCourt = await storage.getActiveMatchSuggestionForCourt(court.id);
+            const safeToRecover = !liveOnCourt || liveOnCourt.id === suggestionId;
+            if (safeToRecover) {
+              await storage.updateCourt(court.id, {
+                status: 'available',
+                timeRemaining: 0,
+                winningTeam: null,
+                startedAt: null,
+              });
+              await storage.setCourtPlayers(court.id, []);
+            } else {
+              console.log(`[submit-score] alreadySubmitted recovery skipped — court ${court.id} now hosts suggestion ${liveOnCourt.id}, not ${suggestionId}`);
+            }
           } catch (recoveryErr) {
             console.error('[submit-score] alreadySubmitted legacy-recovery failed:', recoveryErr);
           }

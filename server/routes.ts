@@ -2258,22 +2258,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // request would have returned after its full post-tx pass.
       if (txResult.alreadySubmitted) {
         console.log(`[END-GAME] Duplicate end-game for court ${court.id} ignored (game ${txResult.gameId} already recorded).`);
-        // Idempotent legacy-cleanup recovery. Non-idempotent side
-        // effects (rest states, queue append, partner history) MUST
-        // stay skipped — they would double-count. But the court
-        // reset itself is idempotent and re-running it here recovers
-        // from the partial-write window where the winning tx
-        // committed but the handler crashed before resetting court
-        // state. Without this, a retry returns alreadySubmitted and
-        // admin sees a phantom-occupied court forever.
+        // Idempotent legacy-cleanup recovery — STRICTLY GUARDED.
+        // Same risk as submit-score: a stale retry on an older
+        // completed game must not wipe a newer live game on the
+        // same court. Only run reset when the court has no active
+        // suggestion or the active one is the same we're ending.
+        // Non-idempotent side effects (rest states, queue append,
+        // partner history) MUST stay skipped — they would double-count.
         try {
-          await storage.updateCourt(court.id, {
-            status: 'available',
-            timeRemaining: 0,
-            winningTeam: null,
-            startedAt: null,
-          });
-          await storage.setCourtPlayers(court.id, []);
+          const liveOnCourt = await storage.getActiveMatchSuggestionForCourt(court.id);
+          const safeToRecover = !liveOnCourt
+            || (activeSuggestionIdForGame && liveOnCourt.id === activeSuggestionIdForGame);
+          if (safeToRecover) {
+            await storage.updateCourt(court.id, {
+              status: 'available',
+              timeRemaining: 0,
+              winningTeam: null,
+              startedAt: null,
+            });
+            await storage.setCourtPlayers(court.id, []);
+          } else {
+            console.log(`[END-GAME] alreadySubmitted recovery skipped — court ${court.id} now hosts suggestion ${liveOnCourt.id}, not ${activeSuggestionIdForGame}`);
+          }
         } catch (recoveryErr) {
           console.error(`[END-GAME] alreadySubmitted legacy-recovery for court ${court.id} failed:`, recoveryErr);
         }
