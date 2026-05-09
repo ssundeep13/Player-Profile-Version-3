@@ -35,7 +35,7 @@ import { confirmZiinaBookingByIntentId } from "./webhookHandler";
 import { completeReferral } from "./referrals";
 import { OAuth2Client } from "google-auth-library";
 import { db } from "./db";
-import { sql, eq, and, inArray, desc, asc, gt } from "drizzle-orm";
+import { sql, eq, ne, and, inArray, desc, asc, gt } from "drizzle-orm";
 import { players, matchSuggestions, matchSuggestionPlayers, courts, sessions, bookings, bookableSessions, gameParticipants, gameResults } from "@shared/schema";
 import { applyPendingSignupCredit, creditForPromo } from "./promos";
 import {
@@ -3548,7 +3548,38 @@ export function registerMarketplaceRoutes(app: Express) {
             ));
         }
 
-        // 3. Fire-and-forget rematchmaking so the remaining waiting
+        // 3. Defensive legacy-status reset. The player should be
+        //    'waiting' after tap-out — but past code paths or a stale
+        //    crash mid-flow could leave players.status='playing' set
+        //    even though no live 'playing' suggestion exists for them.
+        //    Single atomic UPDATE: WHERE status != 'playing' AND there
+        //    is NO 'playing' suggestion naming this player. Avoids the
+        //    check-then-act race where startApprovedSuggestion could
+        //    flip a 4th lineup mate to 'playing' between a separate
+        //    SELECT and UPDATE — the entire predicate is evaluated
+        //    in one statement against the current row state. If they
+        //    ARE on a live court, the EXISTS clause short-circuits
+        //    (zero rows updated), preserving the 'playing' flag.
+        try {
+          await db
+            .update(players)
+            .set({ status: 'waiting' })
+            .where(and(
+              eq(players.id, linkedPlayerId),
+              ne(players.status, 'playing'),
+              sql`NOT EXISTS (
+                SELECT 1 FROM ${matchSuggestions} ms
+                INNER JOIN ${matchSuggestionPlayers} msp ON ms.id = msp.suggestion_id
+                WHERE ms.session_id = ${activeSession.id}
+                  AND msp.player_id = ${linkedPlayerId}
+                  AND ms.status = 'playing'
+              )`,
+            ));
+        } catch (statusErr) {
+          console.error('[me/done] defensive status reset failed:', statusErr);
+        }
+
+        // 4. Fire-and-forget rematchmaking so the remaining waiting
         //    players get reassigned to any newly free pending slot.
         setImmediate(() => {
           tryAutoMatchmaking(activeSession.id).catch(err => {
