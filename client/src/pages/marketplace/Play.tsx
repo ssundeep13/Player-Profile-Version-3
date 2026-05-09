@@ -371,7 +371,11 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
     const status = suggestion?.status ?? null;
     const prev = lastStatusRef.current;
     lastStatusRef.current = status;
-    if (prev !== 'approved' && status === 'approved') {
+    // Strict in-session transition: only fire when we observed the
+    // pending state ourselves first. Landing fresh on an already-
+    // approved suggestion (null → approved mount) shouldn't trigger
+    // the chime/vibrate/title rewrite — the player already knows.
+    if (prev === 'pending' && status === 'approved') {
       try { playChime(); } catch {}
       try { navigator.vibrate?.([200, 100, 200]); } catch {}
       const courtRaw = stripCourtPrefix(suggestion?.courtName);

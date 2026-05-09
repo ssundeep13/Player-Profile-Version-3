@@ -3801,15 +3801,16 @@ export function registerMarketplaceRoutes(app: Express) {
         const { bookableSessionId } = req.params;
         const userId = req.user!.userId;
 
-        // Authorization: caller must have a booking for this session
-        // (any non-cancelled status — confirmed, attended, waitlisted,
-        // pending_payment all qualify). Without this gate any logged-in
-        // user could enumerate attendance for arbitrary sessions by id.
+        // Authorization: caller must hold a confirmed or attended
+        // booking for this session. Waitlisted / pending-payment
+        // bookings don't yet entitle the holder to see who else is
+        // there. This prevents arbitrary session attendance enumeration.
         const callerBooking = await storage.getUserBookingForSession(
           userId,
           bookableSessionId,
         );
-        if (!callerBooking || callerBooking.status === 'cancelled') {
+        const allowedStatuses = new Set(['confirmed', 'attended']);
+        if (!callerBooking || !allowedStatuses.has(callerBooking.status)) {
           return res.status(404).json({ error: 'Not found.' });
         }
 
