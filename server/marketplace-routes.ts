@@ -36,7 +36,7 @@ import { completeReferral } from "./referrals";
 import { OAuth2Client } from "google-auth-library";
 import { db } from "./db";
 import { sql, eq, and, inArray, desc, asc, gt } from "drizzle-orm";
-import { players, matchSuggestions, matchSuggestionPlayers, courts, sessions, bookings, bookableSessions, gameParticipants, gameResults } from "@shared/schema";
+import { players, matchSuggestions, matchSuggestionPlayers, courts, sessions, bookings, bookableSessions, gameParticipants, gameResults, marketplaceUsers, bookingGuests } from "@shared/schema";
 import { applyPendingSignupCredit, creditForPromo } from "./promos";
 import {
   generateBracketedLineups,
@@ -3439,9 +3439,10 @@ export function registerMarketplaceRoutes(app: Express) {
           return res.json({ suggestion: null });
         }
 
-        // Batched joins: court name + the 4 player display names.
+        // Batched joins: court name (and startedAt for the playing-screen
+        // server-anchored timer) + the 4 player display names.
         const [court] = await db
-          .select({ id: courts.id, name: courts.name })
+          .select({ id: courts.id, name: courts.name, startedAt: courts.startedAt })
           .from(courts)
           .where(eq(courts.id, parent.courtId))
           .limit(1);
@@ -3451,6 +3452,25 @@ export function registerMarketplaceRoutes(app: Express) {
           ? await storage.getPlayersByIds(playerIds)
           : [];
         const nameById = new Map(playerRecords.map(p => [p.id, p.name]));
+        const tierById = new Map(playerRecords.map(p => [p.id, tierDisplayName(p.level)]));
+
+        // Per-player photo URLs come from marketplaceUsers.photoUrl, joined
+        // via linkedPlayerId. Players without a linked marketplace account
+        // (admin-imported only) simply get null and the frontend renders
+        // initials in the fallback avatar.
+        let photoById = new Map<string, string | null>();
+        if (playerIds.length > 0) {
+          try {
+            const users = await storage.getMarketplaceUsersByLinkedPlayerIds(playerIds);
+            photoById = new Map(
+              users
+                .filter(u => u.linkedPlayerId)
+                .map(u => [u.linkedPlayerId as string, u.photoUrl ?? null]),
+            );
+          } catch (puErr) {
+            console.error('[current-suggestion] photo lookup failed:', puErr);
+          }
+        }
 
         // Identify which team the requesting player is on so the frontend can
         // render "Your team" vs "Opponents" from the player's perspective.
@@ -3464,6 +3484,7 @@ export function registerMarketplaceRoutes(app: Express) {
             status: parent.status,
             courtId: parent.courtId,
             courtName: court?.name ?? '',
+            startedAt: court?.startedAt ? court.startedAt.toISOString() : null,
             pendingUntil: parent.pendingUntil,
             // Drives the muted "Lineup may adjust before the game starts"
             // note on the player's On-Deck card. true only for queued
@@ -3477,6 +3498,8 @@ export function registerMarketplaceRoutes(app: Express) {
               playerId: p.playerId,
               playerName: nameById.get(p.playerId) ?? 'Player',
               team: p.team,
+              photoUrl: photoById.get(p.playerId) ?? null,
+              tierName: tierById.get(p.playerId) ?? '',
             })),
           },
         });
@@ -3649,10 +3672,172 @@ export function registerMarketplaceRoutes(app: Express) {
         const gamesPlayed = gpRows.length;
         const wins = gpRows.filter(r => r.team === r.winningTeam).length;
 
-        return res.json({ gamesPlayed, wins, skillScore, tierName });
+        // Live waiting context: queue position (1-based), courts currently
+        // in play (with startedAt for the elapsed-time strip), and the
+        // player's most recent finished game in this session.
+        let queuePosition: number | null = null;
+        try {
+          const queue = await storage.getQueue(activeSession.id);
+          const idx = queue.indexOf(linkedPlayerId);
+          queuePosition = idx >= 0 ? idx + 1 : null;
+        } catch (qErr) {
+          console.error('[today-stats] queue lookup failed:', qErr);
+        }
+
+        let courtsInPlay: Array<{ id: string; name: string; startedAt: string | null }> = [];
+        try {
+          const allCourts = await storage.getCourtsBySession(activeSession.id);
+          courtsInPlay = allCourts
+            .filter(c => c.status === 'occupied')
+            .map(c => ({
+              id: c.id,
+              name: c.name,
+              startedAt: c.startedAt ? c.startedAt.toISOString() : null,
+            }));
+        } catch (cErr) {
+          console.error('[today-stats] courts lookup failed:', cErr);
+        }
+
+        let lastGame:
+          | {
+              gameId: string;
+              won: boolean;
+              myScore: number;
+              theirScore: number;
+              partnerName: string | null;
+              opponentNames: string[];
+            }
+          | null = null;
+        try {
+          const [recent] = await db
+            .select({
+              gameId: gameResults.id,
+              team1Score: gameResults.team1Score,
+              team2Score: gameResults.team2Score,
+              winningTeam: gameResults.winningTeam,
+              myTeam: gameParticipants.team,
+            })
+            .from(gameParticipants)
+            .innerJoin(gameResults, eq(gameParticipants.gameId, gameResults.id))
+            .where(and(
+              eq(gameParticipants.playerId, linkedPlayerId),
+              eq(gameResults.sessionId, activeSession.id),
+            ))
+            .orderBy(desc(gameResults.createdAt))
+            .limit(1);
+
+          if (recent) {
+            const others = await db
+              .select({
+                playerId: gameParticipants.playerId,
+                team: gameParticipants.team,
+                name: players.name,
+              })
+              .from(gameParticipants)
+              .innerJoin(players, eq(players.id, gameParticipants.playerId))
+              .where(eq(gameParticipants.gameId, recent.gameId));
+
+            const partner = others.find(o => o.team === recent.myTeam && o.playerId !== linkedPlayerId);
+            const opponents = others.filter(o => o.team !== recent.myTeam);
+            const myScore = recent.myTeam === 1 ? recent.team1Score : recent.team2Score;
+            const theirScore = recent.myTeam === 1 ? recent.team2Score : recent.team1Score;
+            lastGame = {
+              gameId: recent.gameId,
+              won: recent.myTeam === recent.winningTeam,
+              myScore,
+              theirScore,
+              partnerName: partner?.name ?? null,
+              opponentNames: opponents.map(o => o.name),
+            };
+          }
+        } catch (lgErr) {
+          console.error('[today-stats] last game lookup failed:', lgErr);
+        }
+
+        return res.json({
+          gamesPlayed,
+          wins,
+          skillScore,
+          tierName,
+          queuePosition,
+          courtsInPlay,
+          lastGame,
+        });
       } catch (error) {
         console.error('[GET /api/marketplace/players/me/today-stats] error:', error);
         return res.status(500).json({ error: "Couldn't load today's stats." });
+      }
+    },
+  );
+
+  // Returns the people already checked in for a given bookable session, so
+  // the check-in screen can render an avatar rail of "who else is here".
+  // No auth-side filtering — any authenticated marketplace user can see it
+  // for any bookable session (no sensitive data; mirrors what's already
+  // visible in the public roster). Includes attended primary bookers and
+  // their attended guests. Self is included; the frontend can choose to
+  // hide it.
+  app.get(
+    "/api/marketplace/sessions/:bookableSessionId/checked-in",
+    requireAuth,
+    requireMarketplaceAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const { bookableSessionId } = req.params;
+        const userId = req.user!.userId;
+
+        // Authorization: caller must have a booking for this session
+        // (any non-cancelled status — confirmed, attended, waitlisted,
+        // pending_payment all qualify). Without this gate any logged-in
+        // user could enumerate attendance for arbitrary sessions by id.
+        const callerBooking = await storage.getUserBookingForSession(
+          userId,
+          bookableSessionId,
+        );
+        if (!callerBooking || callerBooking.status === 'cancelled') {
+          return res.status(404).json({ error: 'Not found.' });
+        }
+
+        // Primary bookers who are checked in.
+        const primaryRows = await db
+          .select({
+            userId: bookings.userId,
+            name: marketplaceUsers.name,
+            photoUrl: marketplaceUsers.photoUrl,
+          })
+          .from(bookings)
+          .innerJoin(marketplaceUsers, eq(marketplaceUsers.id, bookings.userId))
+          .where(and(
+            eq(bookings.sessionId, bookableSessionId),
+            eq(bookings.status, 'attended'),
+          ));
+
+        // Guests who are checked in (booking is attended; guest itself is
+        // not cancelled). Guests don't carry photo URLs, so the rail
+        // renders an initials fallback.
+        const guestRows = await db
+          .select({
+            id: bookingGuests.id,
+            name: bookingGuests.name,
+          })
+          .from(bookingGuests)
+          .innerJoin(bookings, eq(bookings.id, bookingGuests.bookingId))
+          .where(and(
+            eq(bookings.sessionId, bookableSessionId),
+            eq(bookings.status, 'attended'),
+            sql`${bookingGuests.cancelledAt} IS NULL`,
+            sql`${bookingGuests.isPrimary} = false`,
+          ));
+
+        const players: Array<{ id: string; name: string; photoUrl: string | null }> = [
+          ...primaryRows.map(r => ({ id: r.userId, name: r.name, photoUrl: r.photoUrl ?? null })),
+          ...guestRows.map(r => ({ id: r.id, name: r.name, photoUrl: null })),
+        ];
+
+        return res.json({ players });
+      } catch (error) {
+        console.error('[GET /api/marketplace/sessions/:id/checked-in] error:', error);
+        return res.status(500).json({ error: "Couldn't load checked-in players." });
       }
     },
   );

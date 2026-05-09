@@ -1,11 +1,24 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'wouter';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { format } from 'date-fns';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { MapPin, Clock, Calendar as CalendarIcon, Loader2, Trophy, Users, LayoutGrid } from 'lucide-react';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import { MapPin, Clock, Calendar as CalendarIcon, Loader2, Users, ListOrdered, Trophy, ExternalLink } from 'lucide-react';
 import { apiRequest } from '@/lib/queryClient';
 import { usePageTitle } from '@/hooks/usePageTitle';
 import { useToast } from '@/hooks/use-toast';
@@ -19,26 +32,35 @@ interface CurrentSuggestionPlayer {
   playerId: string;
   playerName: string;
   team: number;
+  photoUrl: string | null;
+  tierName: string;
 }
 
 interface CurrentSuggestion {
   id: string;
-  // 'dismissed' is surfaced briefly by the backend (10-min window) when
-  // the admin cancels a game, so PlayingScreen can detect the cancel and
-  // route back to the waiting screen. The waiting screen itself treats
-  // 'dismissed' as "no live suggestion" — see the render branch below.
-  // 'queued' = pre-built next-round lineup waiting on an occupied court;
-  // rendered as the "On deck" variant.
   status: 'pending' | 'approved' | 'playing' | 'dismissed' | 'queued';
   courtId: string;
   courtName: string;
+  startedAt: string | null;
   pendingUntil: string | null;
-  // true only for queued rows that mix in 1+ currently-playing players
-  // (Case 2/3 of the orchestrator). Drives the muted "Lineup may adjust
-  // before the game starts" note on the OnDeckCard.
   includesActivePlayers: boolean;
   selfTeam: 1 | 2 | null;
   players: CurrentSuggestionPlayer[];
+}
+
+interface CourtInPlay {
+  id: string;
+  name: string;
+  startedAt: string | null;
+}
+
+interface LastGameSummary {
+  gameId: string;
+  won: boolean;
+  myScore: number;
+  theirScore: number;
+  partnerName: string | null;
+  opponentNames: string[];
 }
 
 interface TodayStatsResponse {
@@ -46,10 +68,17 @@ interface TodayStatsResponse {
   wins: number;
   skillScore: number;
   tierName: string;
+  queuePosition: number | null;
+  courtsInPlay: CourtInPlay[];
+  lastGame: LastGameSummary | null;
 }
 
 interface CurrentSuggestionResponse {
   suggestion: CurrentSuggestion | null;
+}
+
+interface CheckedInResponse {
+  players: Array<{ id: string; name: string; photoUrl: string | null }>;
 }
 
 const NAVY = '#003E8C';
@@ -71,8 +100,6 @@ export default function Play() {
     staleTime: 0,
   });
 
-  // Pick the booking whose bookable session is linked to the currently-active
-  // admin session — that's "today's session" for this player.
   const todaysBooking = useMemo<BookingWithDetails | null>(() => {
     const activeId = activeSessionQuery.data?.activeSessionId;
     const bookings = bookingsQuery.data;
@@ -104,8 +131,6 @@ export default function Play() {
         <CheckInScreen
           booking={todaysBooking}
           onCheckedIn={() => {
-            // Refetch the bookings list — attendedAt becomes set, which flips
-            // the page into the waiting state on the next render.
             queryClient.invalidateQueries({ queryKey: ['/api/marketplace/bookings/mine'] });
           }}
         />
@@ -122,7 +147,7 @@ export default function Play() {
 
 function PageShell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mx-auto w-full max-w-md px-4 py-6 sm:py-10" data-testid="page-play">
+    <div className="mx-auto w-full max-w-md px-4 py-6 sm:py-10 pb-36" data-testid="page-play">
       {children}
     </div>
   );
@@ -183,8 +208,28 @@ function CheckInScreen({
     },
   });
 
+  const checkedInQuery = useQuery<CheckedInResponse>({
+    queryKey: ['/api/marketplace/sessions', booking.session.id, 'checked-in'],
+    queryFn: async () => {
+      return await apiRequest<CheckedInResponse>(
+        'GET',
+        `/api/marketplace/sessions/${booking.session.id}/checked-in`,
+      );
+    },
+    refetchInterval: 15_000,
+    staleTime: 0,
+  });
+
   const sessionDate = booking.session.date ? new Date(booking.session.date) : null;
   const dateLabel = sessionDate ? format(sessionDate, 'EEEE, MMMM d') : '';
+  const venueName = booking.session.venueName;
+  const mapHref = booking.session.venueMapUrl
+    ? booking.session.venueMapUrl
+    : venueName
+      ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(venueName)}`
+      : null;
+
+  const checkedInPlayers = checkedInQuery.data?.players ?? [];
 
   return (
     <div className="space-y-6" data-testid="state-checkin">
@@ -201,8 +246,21 @@ function CheckInScreen({
         <CardContent className="py-5 space-y-3">
           <div className="flex items-start gap-3">
             <MapPin className="w-4 h-4 mt-0.5 shrink-0 text-muted-foreground" />
-            <div className="text-sm">
-              <p className="font-medium" data-testid="text-venue-name">{booking.session.venueName}</p>
+            <div className="text-sm flex-1 min-w-0">
+              {mapHref ? (
+                <a
+                  href={mapHref}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium hover:underline inline-flex items-center gap-1"
+                  data-testid="link-venue-map"
+                >
+                  <span data-testid="text-venue-name">{venueName}</span>
+                  <ExternalLink className="w-3 h-3 text-muted-foreground" />
+                </a>
+              ) : (
+                <p className="font-medium" data-testid="text-venue-name">{venueName}</p>
+              )}
               {booking.session.title ? (
                 <p className="text-muted-foreground text-xs mt-0.5" data-testid="text-session-title">
                   {booking.session.title}
@@ -221,6 +279,29 @@ function CheckInScreen({
         </CardContent>
       </Card>
 
+      {checkedInPlayers.length > 0 ? (
+        <div className="space-y-2" data-testid="row-checked-in-rail">
+          <p className="text-xs uppercase tracking-wider text-muted-foreground">
+            Already here ({checkedInPlayers.length})
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {checkedInPlayers.slice(0, 12).map((p) => (
+              <div key={p.id} className="flex items-center" data-testid={`avatar-checked-in-${p.id}`}>
+                <Avatar className="h-9 w-9 border">
+                  {p.photoUrl ? <AvatarImage src={p.photoUrl} alt={p.name} /> : null}
+                  <AvatarFallback className="text-xs">{getInitials(p.name)}</AvatarFallback>
+                </Avatar>
+              </div>
+            ))}
+            {checkedInPlayers.length > 12 ? (
+              <span className="text-xs text-muted-foreground self-center">
+                +{checkedInPlayers.length - 12} more
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       {errorMessage ? (
         <div
           role="alert"
@@ -231,22 +312,24 @@ function CheckInScreen({
         </div>
       ) : null}
 
-      <Button
-        size="lg"
-        className="w-full text-base h-14"
-        onClick={() => checkInMutation.mutate()}
-        disabled={checkInMutation.isPending}
-        data-testid="button-checkin"
-      >
-        {checkInMutation.isPending ? (
-          <>
-            <Loader2 className="w-4 h-4 animate-spin" />
-            Checking you in…
-          </>
-        ) : (
-          'Check in'
-        )}
-      </Button>
+      <StickyCta>
+        <Button
+          size="lg"
+          className="w-full text-base h-14"
+          onClick={() => checkInMutation.mutate()}
+          disabled={checkInMutation.isPending}
+          data-testid="button-checkin"
+        >
+          {checkInMutation.isPending ? (
+            <>
+              <Loader2 className="mr-2 w-4 h-4 animate-spin" />
+              Checking you in…
+            </>
+          ) : (
+            'Check in'
+          )}
+        </Button>
+      </StickyCta>
     </div>
   );
 }
@@ -270,20 +353,35 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
 
   const suggestion = suggestionQuery.data?.suggestion ?? null;
 
-  // Auto-transition to the playing screen (P7) when the suggestion flips to
-  // 'playing'. P7 is not yet built — wouter falls through to NotFound, which
-  // is acceptable for this phase per the plan.
+  // Court-ready alert: chime + vibrate + title rewrite on pending → approved.
+  // Tracked across renders via ref so we only fire once per transition.
+  const lastStatusRef = useRef<string | null>(null);
+  useEffect(() => {
+    const status = suggestion?.status ?? null;
+    const prev = lastStatusRef.current;
+    // Update the ref AFTER the transition check, otherwise prev === status
+    // on the very render that flipped the status, and the alert never fires.
+    if (prev !== 'approved' && status === 'approved') {
+      lastStatusRef.current = status;
+      try { playChime(); } catch {}
+      try { navigator.vibrate?.([200, 100, 200]); } catch {}
+      const courtName = suggestion?.courtName || 'your court';
+      const originalTitle = document.title;
+      document.title = `Court ready — ${courtName}`;
+      const restore = window.setTimeout(() => {
+        document.title = originalTitle;
+      }, 30_000);
+      return () => window.clearTimeout(restore);
+    }
+    lastStatusRef.current = status;
+  }, [suggestion?.status, suggestion?.courtName]);
+
   useEffect(() => {
     if (suggestion?.status === 'playing') {
       setLocation('/marketplace/play/playing');
     }
   }, [suggestion?.status, setLocation]);
 
-  // "I'm done for today" — wired to the dedicated backend endpoint that
-  // removes the player from the queue, dismisses any open suggestion
-  // they're named on, and fires re-matchmaking. We always navigate back
-  // to /marketplace after the call resolves (success or failure) so the
-  // player isn't trapped on the waiting screen if something goes wrong.
   const doneMutation = useMutation({
     mutationFn: async () => {
       return await apiRequest<{ success: boolean }>(
@@ -306,8 +404,6 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
     },
   });
 
-  // Initial-load skeleton only. Background polls do NOT re-trigger this
-  // (we ignore isFetching) so the screen stays calm.
   if (suggestionQuery.isPending) {
     return (
       <div className="space-y-6" data-testid="state-waiting-loading">
@@ -330,12 +426,11 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
         </h1>
       </div>
 
-      <StatChips stats={stats} />
+      <WaitingChips stats={stats} />
+
+      <CourtsInPlayStrip courts={stats?.courtsInPlay ?? []} />
 
       {!suggestion || suggestion.status === 'dismissed' ? (
-        // 'dismissed' is surfaced briefly so PlayingScreen can detect an
-        // admin cancel-game; for the waiting screen it just means "no
-        // live game", same as a null suggestion.
         <FindingNextGameCard />
       ) : suggestion.status === 'queued' ? (
         <OnDeckCard suggestion={suggestion} />
@@ -343,38 +438,63 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
         <NextGameCard suggestion={suggestion} />
       )}
 
+      {stats?.lastGame ? <LastGameCard last={stats.lastGame} /> : null}
+
       <div className="pt-4 flex justify-center">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => doneMutation.mutate()}
-          disabled={doneMutation.isPending}
-          data-testid="button-done-for-today"
-        >
-          {doneMutation.isPending ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Signing you out…
-            </>
-          ) : (
-            "I'm done for today"
-          )}
-        </Button>
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button
+              variant="outline"
+              size="default"
+              disabled={doneMutation.isPending}
+              data-testid="button-done-for-today"
+            >
+              {doneMutation.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Signing you out…
+                </>
+              ) : (
+                "I'm done for today"
+              )}
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent data-testid="dialog-confirm-done">
+            <AlertDialogHeader>
+              <AlertDialogTitle>Done for today?</AlertDialogTitle>
+              <AlertDialogDescription>
+                We'll take you out of the queue and skip you for the next round.
+                You can always check back in if you change your mind.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel data-testid="button-confirm-done-cancel">Stay in queue</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => doneMutation.mutate()}
+                data-testid="button-confirm-done-confirm"
+              >
+                Yes, I'm done
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     </div>
   );
 }
 
-function StatChips({ stats }: { stats: TodayStatsResponse | undefined }) {
-  // Three small chips of player context for the WaitingScreen header:
-  // "Games Today" (gamesPlayed in this session), "Wins" (gamesPlayed
-  // restricted to wins), and "Current Tier" (display name of the
-  // player's confirmed level). Layout doesn't change between loaded /
-  // loading so the page doesn't jump on first render.
-  const items: Array<{ icon: typeof Trophy; label: string; value: number | string; testId: string }> = [
-    { icon: Trophy, label: 'Games today', value: stats?.gamesPlayed ?? '—', testId: 'stat-games-today' },
-    { icon: Users, label: 'Wins', value: stats?.wins ?? '—', testId: 'stat-wins' },
-    { icon: LayoutGrid, label: 'Current tier', value: stats?.tierName || '—', testId: 'stat-current-tier' },
+function WaitingChips({ stats }: { stats: TodayStatsResponse | undefined }) {
+  // Useful at-a-glance info: queue position, courts currently in play, and
+  // games already played today. Replaces the duplicated games/wins/tier
+  // chips that overlap with the stats already on /marketplace/dashboard.
+  const queueLabel =
+    stats?.queuePosition == null ? '—' : `#${stats.queuePosition}`;
+  const courtsBusy = stats?.courtsInPlay.length ?? 0;
+  const courtsTotal = courtsBusy; // we only know the busy count from this endpoint
+  const items: Array<{ icon: typeof ListOrdered; label: string; value: string; testId: string }> = [
+    { icon: ListOrdered, label: 'Queue', value: queueLabel, testId: 'stat-queue-position' },
+    { icon: Users, label: 'Courts in play', value: courtsTotal === 0 ? '0' : String(courtsBusy), testId: 'stat-courts-in-play' },
+    { icon: Trophy, label: 'Games today', value: String(stats?.gamesPlayed ?? '—'), testId: 'stat-games-today' },
   ];
   return (
     <div className="grid grid-cols-3 gap-2" data-testid="row-stat-chips">
@@ -400,11 +520,74 @@ function StatChips({ stats }: { stats: TodayStatsResponse | undefined }) {
   );
 }
 
+function CourtsInPlayStrip({ courts }: { courts: CourtInPlay[] }) {
+  // Live elapsed-time strip per occupied court, anchored on each court's
+  // server `startedAt`. We keep our own seconds counter so the labels tick
+  // forward smoothly between the 10s polls.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  if (courts.length === 0) return null;
+
+  return (
+    <div className="space-y-2" data-testid="row-courts-in-play">
+      <p className="text-xs uppercase tracking-wider text-muted-foreground">
+        Courts in play
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {courts.map(c => {
+          const elapsed = c.startedAt
+            ? Math.max(0, Math.floor((now - new Date(c.startedAt).getTime()) / 1000))
+            : null;
+          return (
+            <Badge
+              key={c.id}
+              variant="secondary"
+              className="font-medium"
+              data-testid={`chip-court-${c.id}`}
+            >
+              <span className="font-semibold" style={{ color: NAVY }}>
+                {c.name}
+              </span>
+              <span className="ml-2 text-xs text-muted-foreground tabular-nums">
+                {elapsed == null ? 'in play' : formatElapsed(elapsed)}
+              </span>
+            </Badge>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function LastGameCard({ last }: { last: LastGameSummary }) {
+  const opponents = last.opponentNames.length
+    ? last.opponentNames.join(' & ')
+    : 'opponents';
+  const partner = last.partnerName ? ` with ${last.partnerName}` : '';
+  return (
+    <Card data-testid="card-last-game">
+      <CardContent className="py-3 px-4 flex items-center justify-between gap-3">
+        <div className="text-sm flex-1 min-w-0">
+          <p className="text-xs uppercase tracking-wider text-muted-foreground">
+            Last game
+          </p>
+          <p className="truncate" data-testid="text-last-game-summary">
+            <span className="font-semibold" style={{ color: last.won ? TEAL : NAVY }}>
+              {last.won ? 'Won' : 'Lost'} {last.myScore}–{last.theirScore}
+            </span>{' '}
+            <span className="text-muted-foreground">vs {opponents}{partner}</span>
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function OnDeckCard({ suggestion }: { suggestion: CurrentSuggestion }) {
-  // 'queued' lineup — render the same Your team / Opponents structure as
-  // the pending/approved card, but with an "On deck" header and no Start
-  // Game button. The card flips into the regular pending view
-  // automatically on the next 5s poll once the previous game ends.
   const selfTeamNum = suggestion.selfTeam ?? 1;
   const oppTeamNum = selfTeamNum === 1 ? 2 : 1;
   const yourTeam = suggestion.players.filter(p => p.team === selfTeamNum);
@@ -474,10 +657,6 @@ function FindingNextGameCard() {
 }
 
 function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
-  // Render from the current player's perspective. Backend tells us which team
-  // (1 or 2) the requesting player belongs to via `selfTeam`. If unknown
-  // (selfTeam === null) we fall back to team 1 = "Your team" so the UI never
-  // breaks, but in practice the suggestion always contains the player.
   const selfTeamNum = suggestion.selfTeam ?? 1;
   const oppTeamNum = selfTeamNum === 1 ? 2 : 1;
   const yourTeam = suggestion.players.filter((p) => p.team === selfTeamNum);
@@ -487,19 +666,8 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
-  // Start-game mutation lives next to the button it drives. On success we
-  // invalidate the polled suggestion query so the existing useEffect in
-  // WaitingScreen (which navigates to /playing when status === 'playing')
-  // fires on the next refetch instead of waiting up to 5 s for the natural
-  // poll. We do NOT setLocation here directly so that the same redirect
-  // path is exercised whether this player started the game themselves or
-  // a teammate did — keeps state transitions in one place.
   const startGameMutation = useMutation({
     mutationFn: async () => {
-      // apiRequest already parses the JSON body and throws on non-2xx,
-      // so we get the typed payload directly. Calling .json() on the
-      // result would throw because it is the parsed object, not a
-      // Response. The win/race-loser distinction is in `alreadyStarted`.
       return await apiRequest<{ success: boolean; alreadyStarted: boolean }>(
         'POST',
         `/api/marketplace/games/${suggestion.id}/start-game`,
@@ -511,15 +679,6 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
       });
     },
     onError: (err: unknown) => {
-      // apiRequest throws a plain object of shape { error, status, code? }
-      // (see throwIfResNotOk in client/src/lib/queryClient.ts), NOT an
-      // Error instance. Narrow safely via `in` checks before reading.
-      // 404 (suggestion gone / not yours) and 409 (already started or
-      // dismissed) both mean "this match is no longer available" — toast
-      // the friendly message and let the polled current-suggestion query
-      // reroute the player back to the finding-game state. Any other
-      // failure (network, 500, 401) re-enables the button and surfaces
-      // the generic retry message.
       const isMatchGone =
         typeof err === 'object' &&
         err !== null &&
@@ -540,42 +699,53 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
   });
 
   return (
-    <Card data-testid="card-next-game">
-      <CardContent className="py-6 space-y-5">
-        {isApproved ? (
-          <div className="text-center space-y-1">
-            <p className="text-xs uppercase tracking-wider" style={{ color: TEAL }}>
-              Court ready
-            </p>
-            <h2 className="text-xl font-semibold" data-testid="text-game-heading">
-              Head to{' '}
-              <span style={{ color: TEAL }} data-testid="text-court-name-approved">
-                {suggestion.courtName}
-              </span>{' '}
-              now
-            </h2>
-          </div>
-        ) : (
-          <div className="text-center space-y-1">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">
-              Up next
-            </p>
-            <h2 className="text-xl font-semibold" style={{ color: NAVY }} data-testid="text-game-heading">
-              Your next game
-            </h2>
-            <p className="text-sm text-muted-foreground" data-testid="text-court-name-pending">
-              {suggestion.courtName}
-            </p>
-          </div>
-        )}
+    <>
+      <Card data-testid="card-next-game">
+        <CardContent className="py-6 space-y-5">
+          {isApproved ? (
+            <div className="flex items-center gap-4">
+              <CourtBadge name={suggestion.courtName} />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs uppercase tracking-wider" style={{ color: TEAL }}>
+                  Court ready
+                </p>
+                <h2 className="text-lg font-semibold leading-tight" data-testid="text-game-heading">
+                  Head to{' '}
+                  <span style={{ color: TEAL }} data-testid="text-court-name-approved">
+                    Court {suggestion.courtName}
+                  </span>{' '}
+                  now
+                </h2>
+              </div>
+            </div>
+          ) : (
+            <div className="text-center space-y-1">
+              <p className="text-xs uppercase tracking-wider text-muted-foreground">
+                Up next
+              </p>
+              <h2 className="text-xl font-semibold" style={{ color: NAVY }} data-testid="text-game-heading">
+                Your next game
+              </h2>
+              <p className="text-sm text-muted-foreground" data-testid="text-court-name-pending">
+                Court {suggestion.courtName}
+              </p>
+            </div>
+          )}
 
-        <div className="space-y-3">
-          <TeamRow label="Your team" players={yourTeam} accent={TEAL} testId="team-self" />
-          <div className="text-center text-xs uppercase tracking-wider text-muted-foreground">vs</div>
-          <TeamRow label="Opponents" players={opponents} accent={NAVY} testId="team-opponents" />
-        </div>
+          {!isApproved && suggestion.pendingUntil ? (
+            <PendingCountdown pendingUntil={suggestion.pendingUntil} />
+          ) : null}
 
-        {isApproved && (
+          <div className="space-y-3">
+            <TeamRow label="Your team" players={yourTeam} accent={TEAL} testId="team-self" />
+            <div className="text-center text-xs uppercase tracking-wider text-muted-foreground">vs</div>
+            <TeamRow label="Opponents" players={opponents} accent={NAVY} testId="team-opponents" />
+          </div>
+        </CardContent>
+      </Card>
+
+      {isApproved && (
+        <StickyCta>
           <Button
             size="lg"
             className="w-full text-base h-14"
@@ -592,9 +762,55 @@ function NextGameCard({ suggestion }: { suggestion: CurrentSuggestion }) {
               "We're at the court – start game"
             )}
           </Button>
-        )}
-      </CardContent>
-    </Card>
+        </StickyCta>
+      )}
+    </>
+  );
+}
+
+function CourtBadge({ name }: { name: string }) {
+  return (
+    <div
+      className="h-16 w-16 shrink-0 rounded-md border-2 flex flex-col items-center justify-center"
+      style={{ borderColor: TEAL, backgroundColor: '#F5EFE0' }}
+      data-testid="badge-court-number"
+    >
+      <span className="text-[9px] uppercase tracking-wider" style={{ color: TEAL }}>
+        Court
+      </span>
+      <span className="text-2xl font-bold leading-none" style={{ color: NAVY }}>
+        {name?.trim() || '—'}
+      </span>
+    </div>
+  );
+}
+
+function PendingCountdown({ pendingUntil }: { pendingUntil: string }) {
+  // Server-anchored countdown: we recompute remaining time from the
+  // pendingUntil timestamp every second. Window is assumed to be 90s
+  // (matches the backend pendingUntil = now+90s on insert/flip).
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(id);
+  }, []);
+  const targetMs = new Date(pendingUntil).getTime();
+  const remainingMs = Math.max(0, targetMs - now);
+  const totalMs = 90_000;
+  const fraction = Math.max(0, Math.min(1, remainingMs / totalMs));
+  const seconds = Math.ceil(remainingMs / 1000);
+  return (
+    <div className="space-y-1" data-testid="row-pending-countdown">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full transition-[width] duration-300 ease-linear"
+          style={{ width: `${fraction * 100}%`, backgroundColor: TEAL }}
+        />
+      </div>
+      <p className="text-xs text-center text-muted-foreground tabular-nums">
+        Lineup confirms in {seconds}s
+      </p>
+    </div>
   );
 }
 
@@ -611,20 +827,90 @@ function TeamRow({
 }) {
   return (
     <div data-testid={`row-${testId}`}>
-      <p className="text-xs uppercase tracking-wider mb-1" style={{ color: accent }}>
+      <p className="text-xs uppercase tracking-wider mb-2" style={{ color: accent }}>
         {label}
       </p>
-      <div className="space-y-1">
+      <div className="space-y-2">
         {players.length === 0 ? (
           <p className="text-sm text-muted-foreground">—</p>
         ) : (
           players.map((p) => (
-            <p key={p.playerId} className="text-base font-medium" data-testid={`text-player-${p.playerId}`}>
-              {p.playerName}
-            </p>
+            <div
+              key={p.playerId}
+              className="flex items-center gap-3"
+              data-testid={`text-player-${p.playerId}`}
+            >
+              <Avatar className="h-9 w-9 border">
+                {p.photoUrl ? <AvatarImage src={p.photoUrl} alt={p.playerName} /> : null}
+                <AvatarFallback className="text-xs">{getInitials(p.playerName)}</AvatarFallback>
+              </Avatar>
+              <div className="flex-1 min-w-0">
+                <p className="text-base font-medium leading-tight truncate">{p.playerName}</p>
+                {p.tierName ? (
+                  <p className="text-xs text-muted-foreground leading-tight" data-testid={`text-player-tier-${p.playerId}`}>
+                    {p.tierName}
+                  </p>
+                ) : null}
+              </div>
+            </div>
           ))
         )}
       </div>
     </div>
   );
+}
+
+function StickyCta({ children }: { children: React.ReactNode }) {
+  // Pinned to the bottom of the viewport on mobile so primary CTAs are
+  // always thumb-reachable. On desktop we stop pinning at the `sm`
+  // breakpoint and let the button flow inline.
+  return (
+    <div
+      className="sm:static fixed inset-x-0 bottom-0 z-40 px-4 sm:px-0 sm:py-0"
+      style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 0.75rem)', paddingTop: '0.75rem' }}
+    >
+      <div
+        className="sm:bg-transparent sm:border-0 sm:shadow-none bg-background/95 backdrop-blur border-t shadow-lg sm:p-0 -mx-4 sm:mx-0 px-4 sm:px-0 py-3 sm:py-0"
+      >
+        <div className="mx-auto w-full max-w-md">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function getInitials(name: string): string {
+  if (!name) return '?';
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function formatElapsed(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(safe / 60);
+  const seconds = safe % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+// Soft court-ready chime built with Web Audio so we don't ship an audio asset.
+// Two short sine tones — quiet enough to be a notification, not a startle.
+function playChime(): void {
+  const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+  if (!Ctx) return;
+  const ctx = new Ctx();
+  const note = (freq: number, start: number, duration: number) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, ctx.currentTime + start);
+    gain.gain.linearRampToValueAtTime(0.18, ctx.currentTime + start + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(ctx.currentTime + start);
+    osc.stop(ctx.currentTime + start + duration + 0.05);
+  };
+  note(880, 0, 0.18);
+  note(1175, 0.18, 0.22);
+  window.setTimeout(() => ctx.close().catch(() => {}), 800);
 }
