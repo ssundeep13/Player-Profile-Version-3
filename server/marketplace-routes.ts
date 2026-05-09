@@ -35,7 +35,7 @@ import { confirmZiinaBookingByIntentId } from "./webhookHandler";
 import { completeReferral } from "./referrals";
 import { OAuth2Client } from "google-auth-library";
 import { db } from "./db";
-import { sql, eq, ne, and, inArray, desc, asc, gt } from "drizzle-orm";
+import { sql, eq, and, inArray, desc, asc, gt } from "drizzle-orm";
 import { players, matchSuggestions, matchSuggestionPlayers, courts, sessions, bookings, bookableSessions, gameParticipants, gameResults } from "@shared/schema";
 import { applyPendingSignupCredit, creditForPromo } from "./promos";
 import {
@@ -3566,7 +3566,7 @@ export function registerMarketplaceRoutes(app: Express) {
             .set({ status: 'waiting' })
             .where(and(
               eq(players.id, linkedPlayerId),
-              ne(players.status, 'playing'),
+              eq(players.status, 'playing'),
               sql`NOT EXISTS (
                 SELECT 1 FROM ${matchSuggestions} ms
                 INNER JOIN ${matchSuggestionPlayers} msp ON ms.id = msp.suggestion_id
