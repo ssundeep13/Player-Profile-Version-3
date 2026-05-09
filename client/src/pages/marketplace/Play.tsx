@@ -354,15 +354,24 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
   const suggestion = suggestionQuery.data?.suggestion ?? null;
 
   // Court-ready alert: chime + vibrate + title rewrite + in-page banner on
-  // pending → approved. Tracked across renders via ref so we only fire
-  // once per transition.
+  // pending → approved. Split into two effects so the banner-hide timer
+  // is owned by a stable, single-purpose effect that doesn't re-run when
+  // unrelated state changes — otherwise React's cleanup would clear the
+  // timer mid-flight and the banner would get stuck on screen.
   const lastStatusRef = useRef<string | null>(null);
   const [showCourtReadyBanner, setShowCourtReadyBanner] = useState(false);
+
+  // Effect A: detect the pending → approved transition exactly once.
+  // Fires the chime, the vibrate, the title rewrite, and flips the
+  // banner-visible flag. Title restoration is owned by this effect via
+  // the ref-tracked transition (so a status flip back to non-approved
+  // also restores it). No timers are cleaned up here on unrelated
+  // re-renders because the dependency list is just status + courtName.
   useEffect(() => {
     const status = suggestion?.status ?? null;
     const prev = lastStatusRef.current;
+    lastStatusRef.current = status;
     if (prev !== 'approved' && status === 'approved') {
-      lastStatusRef.current = status;
       try { playChime(); } catch {}
       try { navigator.vibrate?.([200, 100, 200]); } catch {}
       const courtName = suggestion?.courtName || 'your court';
@@ -372,19 +381,24 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
       const restoreTitle = window.setTimeout(() => {
         document.title = originalTitle;
       }, 30_000);
-      const hideBanner = window.setTimeout(() => {
-        setShowCourtReadyBanner(false);
-      }, 12_000);
       return () => {
         window.clearTimeout(restoreTitle);
-        window.clearTimeout(hideBanner);
+        document.title = originalTitle;
       };
     }
-    if (status !== 'approved' && showCourtReadyBanner) {
+    if (status !== 'approved') {
       setShowCourtReadyBanner(false);
     }
-    lastStatusRef.current = status;
-  }, [suggestion?.status, suggestion?.courtName, showCourtReadyBanner]);
+  }, [suggestion?.status, suggestion?.courtName]);
+
+  // Effect B: own the banner auto-hide timer. Re-arms only when the
+  // banner is (re)shown — which is exactly what we want. Cleanup
+  // cancels the previous timer so we never have two competing fades.
+  useEffect(() => {
+    if (!showCourtReadyBanner) return;
+    const hide = window.setTimeout(() => setShowCourtReadyBanner(false), 12_000);
+    return () => window.clearTimeout(hide);
+  }, [showCourtReadyBanner]);
 
   useEffect(() => {
     if (suggestion?.status === 'playing') {
