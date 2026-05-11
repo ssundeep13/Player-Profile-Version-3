@@ -704,13 +704,69 @@ export function isCourtInPlay(court: { status: string }): boolean {
   return court.status === 'occupied' || court.status === 'playing';
 }
 
-async function runQueuedOrchestrator(
+/**
+ * Tear-down helper used by `runQueuedOrchestrator` (task #69). Looks up
+ * every existing 'queued' suggestion for the session, filters down to
+ * the borrowed (`includesActivePlayers = true`) ones, and dismisses
+ * each via `storage.dismissQueuedSuggestion`. Returns the count
+ * actually dismissed (CAS losers don't count).
+ *
+ * Pure-waiting queued rows are left alone — they're already optimal.
+ *
+ * Exported so the orchestrator-level regression test can mock storage
+ * and exercise the dismissal in isolation, without recreating the full
+ * Drizzle chain.
+ */
+export async function dismissBorrowedQueuedRows(sessionId: string): Promise<number> {
+  const existing = await db
+    .select({
+      id: matchSuggestions.id,
+      includesActivePlayers: matchSuggestions.includesActivePlayers,
+    })
+    .from(matchSuggestions)
+    .where(and(
+      eq(matchSuggestions.sessionId, sessionId),
+      eq(matchSuggestions.status, 'queued'),
+    ));
+  const borrowed = existing.filter(r => r.includesActivePlayers);
+  if (borrowed.length === 0) return 0;
+  let dismissed = 0;
+  for (const row of borrowed) {
+    const result = await storage.dismissQueuedSuggestion(row.id);
+    if (result) dismissed++;
+  }
+  console.log(
+    `[queued-orchestrator] session=${sessionId} dismissed ${dismissed}/${borrowed.length} borrowed queued row(s) before rebuild`,
+  );
+  return dismissed;
+}
+
+export async function runQueuedOrchestrator(
   sessionId: string,
   allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
 ): Promise<void> {
   const allCourts = await storage.getCourtsBySession(sessionId);
   const playingCourts = allCourts.filter(isCourtInPlay);
   if (playingCourts.length === 0) return;
+
+  // Tear-down pass (task #69): dismiss any existing borrowed
+  // (includesActivePlayers=true) queued row so the rebuild below can
+  // absorb newly-checked-in waiters into a more-balanced lineup.
+  //
+  // Without this, the orchestrator's "skip courts that already have a
+  // queued row" guard locks in early greedy borrowed lineups: F1
+  // checks in alone → court 1 gets [F1 + 3 borrowed actives]; F2 then
+  // → court 2 gets [F2 + 3 borrowed]; F3/F4 then arrive but BOTH
+  // courts are already "filled" with borrowed rows, so the
+  // orchestrator skips entirely and F3/F4 fall through to the
+  // read-only ProjectionCard. Tearing borrowed rows down first lets
+  // the rebuild produce 2-waiter-per-court lineups (or pure-waiting
+  // when 4+ waiters are available).
+  //
+  // Pure-waiting (includesActivePlayers=false) queued rows are already
+  // optimal and are left in place — keeping them stable on
+  // score-submit-triggered orchestrator runs avoids needless churn.
+  await dismissBorrowedQueuedRows(sessionId);
 
   const courtsWithQueued = await getCourtsWithQueuedSuggestions(sessionId);
   const courtsNeedingQueued = playingCourts.filter(c => !courtsWithQueued.has(c.id));
