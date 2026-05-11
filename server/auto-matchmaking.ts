@@ -324,7 +324,7 @@ function pickStandardLineup(
 // permutations of each resulting 4-player set via findBalancedTeams, and
 // keep the best (skillGap → splitPenalty → variance — same key as the
 // standard generator).
-function pickLineupWithMustInclude(
+export function pickLineupWithMustInclude(
   sessionId: string,
   mustIncludeIds: string[],
   fillFromIds: string[],

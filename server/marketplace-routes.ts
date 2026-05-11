@@ -3112,6 +3112,24 @@ export function registerMarketplaceRoutes(app: Express) {
         }
       }
 
+      // Eager matchmaking on every queue-join — mirrors the player-driven
+      // self check-in path. Fires whether or not we actually appended
+      // (an idempotent admin re-tap shouldn't fire it twice in a row,
+      // but the orchestrator is a no-op when there's nothing to do, so
+      // we keep the trigger simple). Critically, the queued-orchestrator
+      // pass inside tryAutoMatchmaking now ALWAYS runs even when the
+      // pending pass would skip on "no available courts" — that's how
+      // a player who just joined while every court is busy still gets a
+      // queued (or mixed-pool queued) lineup built for them eagerly.
+      if (queueResult.added && bookableSession?.linkedSessionId) {
+        const linkedSessionId = bookableSession.linkedSessionId;
+        setImmediate(() => {
+          tryAutoMatchmaking(linkedSessionId).catch(err => {
+            console.error('[auto-matchmaking] post-admin-attend unhandled:', err);
+          });
+        });
+      }
+
       res.json({ ...updated, queueResult });
     } catch (error) {
       res.status(500).json({ error: "Failed to mark attendance" });
