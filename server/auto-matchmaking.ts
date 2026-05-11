@@ -197,19 +197,6 @@ async function getPlayersOnAnyOpenSuggestion(sessionId: string): Promise<Set<str
   return new Set(rows.map(r => r.playerId));
 }
 
-// Court IDs that already have a 'queued' next-round suggestion — used by
-// the queued orchestrator so we don't stack two queued rows on one court.
-async function getCourtsWithQueuedSuggestions(sessionId: string): Promise<Set<string>> {
-  const rows = await db
-    .select({ courtId: matchSuggestions.courtId })
-    .from(matchSuggestions)
-    .where(and(
-      eq(matchSuggestions.sessionId, sessionId),
-      eq(matchSuggestions.status, 'queued'),
-    ));
-  return new Set(rows.map(r => r.courtId));
-}
-
 interface Lineup {
   team1Ids: string[];
   team2Ids: string[];
@@ -705,22 +692,33 @@ export function isCourtInPlay(court: { status: string }): boolean {
 }
 
 /**
- * Tear-down helper used by `runQueuedOrchestrator` (task #69). Looks up
- * every existing 'queued' suggestion for the session, filters down to
- * the borrowed (`includesActivePlayers = true`) ones, and dismisses
- * each via `storage.dismissQueuedSuggestion`. Returns the count
- * actually dismissed (CAS losers don't count).
+ * Snapshot of pre-existing 'queued' rows for a session, classified for
+ * the task #69 replace-in-place flow.
  *
- * Pure-waiting queued rows are left alone — they're already optimal.
+ * `borrowedSuggestionByCourtId` — courts whose only queued lineup was
+ * built by borrowing from the active roster. These are eligible for
+ * replacement on the next orchestrator run; the players in them are
+ * returned to the rebuild pool.
  *
- * Exported so the orchestrator-level regression test can mock storage
- * and exercise the dismissal in isolation, without recreating the full
- * Drizzle chain.
+ * `courtsWithPureQueued` — courts that already have a pure-waiting
+ * queued lineup. These are already optimal and the orchestrator skips
+ * them (no churn on score-submit-triggered runs).
  */
-export async function dismissBorrowedQueuedRows(sessionId: string): Promise<number> {
-  const existing = await db
+interface QueuedRowSnapshot {
+  borrowedSuggestionByCourtId: Map<string, string>;
+  courtsWithPureQueued: Set<string>;
+  borrowedPlayerIds: Set<string>;
+}
+
+/**
+ * Loads the queued-row snapshot used by `runQueuedOrchestrator` for the
+ * task #69 replace-in-place flow. Exported for the regression tests.
+ */
+export async function snapshotQueuedRows(sessionId: string): Promise<QueuedRowSnapshot> {
+  const existingRows = await db
     .select({
       id: matchSuggestions.id,
+      courtId: matchSuggestions.courtId,
       includesActivePlayers: matchSuggestions.includesActivePlayers,
     })
     .from(matchSuggestions)
@@ -728,17 +726,31 @@ export async function dismissBorrowedQueuedRows(sessionId: string): Promise<numb
       eq(matchSuggestions.sessionId, sessionId),
       eq(matchSuggestions.status, 'queued'),
     ));
-  const borrowed = existing.filter(r => r.includesActivePlayers);
-  if (borrowed.length === 0) return 0;
-  let dismissed = 0;
-  for (const row of borrowed) {
-    const result = await storage.dismissQueuedSuggestion(row.id);
-    if (result) dismissed++;
+
+  const borrowedSuggestionByCourtId = new Map<string, string>();
+  const courtsWithPureQueued = new Set<string>();
+  for (const r of existingRows) {
+    if (r.includesActivePlayers) {
+      // If a court has multiple borrowed rows (race), only the last
+      // wins this map. The orphan row will be cleaned up on a
+      // subsequent run.
+      borrowedSuggestionByCourtId.set(r.courtId, r.id);
+    } else {
+      courtsWithPureQueued.add(r.courtId);
+    }
   }
-  console.log(
-    `[queued-orchestrator] session=${sessionId} dismissed ${dismissed}/${borrowed.length} borrowed queued row(s) before rebuild`,
-  );
-  return dismissed;
+
+  const borrowedPlayerIds = new Set<string>();
+  if (borrowedSuggestionByCourtId.size > 0) {
+    const borrowedIds = Array.from(borrowedSuggestionByCourtId.values());
+    const playerRows = await db
+      .select({ playerId: matchSuggestionPlayers.playerId })
+      .from(matchSuggestionPlayers)
+      .where(inArray(matchSuggestionPlayers.suggestionId, borrowedIds));
+    for (const r of playerRows) borrowedPlayerIds.add(r.playerId);
+  }
+
+  return { borrowedSuggestionByCourtId, courtsWithPureQueued, borrowedPlayerIds };
 }
 
 export async function runQueuedOrchestrator(
@@ -749,36 +761,40 @@ export async function runQueuedOrchestrator(
   const playingCourts = allCourts.filter(isCourtInPlay);
   if (playingCourts.length === 0) return;
 
-  // Tear-down pass (task #69): dismiss any existing borrowed
-  // (includesActivePlayers=true) queued row so the rebuild below can
-  // absorb newly-checked-in waiters into a more-balanced lineup.
+  // Snapshot existing queued rows (task #69 replace-in-place pass).
   //
-  // Without this, the orchestrator's "skip courts that already have a
-  // queued row" guard locks in early greedy borrowed lineups: F1
-  // checks in alone → court 1 gets [F1 + 3 borrowed actives]; F2 then
-  // → court 2 gets [F2 + 3 borrowed]; F3/F4 then arrive but BOTH
-  // courts are already "filled" with borrowed rows, so the
-  // orchestrator skips entirely and F3/F4 fall through to the
-  // read-only ProjectionCard. Tearing borrowed rows down first lets
-  // the rebuild produce 2-waiter-per-court lineups (or pure-waiting
-  // when 4+ waiters are available).
+  // Pre-fix bug: when waiters checked in one-by-one, the orchestrator
+  // built greedy borrowed lineups (1 waiter + 3 actives) on the first
+  // 2 check-ins, then SKIPPED entirely on the 3rd/4th because both
+  // courts already had a queued row — F3/F4 fell back to the
+  // read-only ProjectionCard.
   //
-  // Pure-waiting (includesActivePlayers=false) queued rows are already
-  // optimal and are left in place — keeping them stable on
-  // score-submit-triggered orchestrator runs avoids needless churn.
-  await dismissBorrowedQueuedRows(sessionId);
+  // Fix: treat borrowed queued rows as eligible for replacement (their
+  // players are returned to the rebuild pool) but only DISMISS each
+  // one AFTER the per-court replacement is successfully created. If
+  // the rebuild for a given court returns null or throws, that
+  // court's prior borrowed row stays in place — players keep seeing
+  // their existing OnDeckCard rather than regressing to
+  // ProjectionCard. Pure-waiting queued rows are skipped entirely
+  // (already optimal — no churn on score-submit-triggered runs).
+  const snapshot = await snapshotQueuedRows(sessionId);
+  const { borrowedSuggestionByCourtId, courtsWithPureQueued, borrowedPlayerIds } = snapshot;
 
-  const courtsWithQueued = await getCourtsWithQueuedSuggestions(sessionId);
-  const courtsNeedingQueued = playingCourts.filter(c => !courtsWithQueued.has(c.id));
+  const courtsNeedingQueued = playingCourts.filter(c => !courtsWithPureQueued.has(c.id));
   if (courtsNeedingQueued.length === 0) return;
 
-  // Pool: queue minus sitting-out minus anyone already on a non-terminal
-  // suggestion (pending|approved|playing|queued). May be < 4 — Case 2/3
-  // below handles 1-3 by mixing in the court's currently-playing roster.
+  // Pool: queue minus sitting-out minus players locked into ANY open
+  // suggestion EXCEPT borrowed-queued rows we intend to replace this
+  // run. Borrowed-queued players are returned to the pool so the
+  // rebuild can re-use them in a more-balanced lineup.
   const onAnyOpen = await getPlayersOnAnyOpenSuggestion(sessionId);
+  const lockedIds = new Set<string>();
+  for (const id of onAnyOpen) {
+    if (!borrowedPlayerIds.has(id)) lockedIds.add(id);
+  }
   const sittingOut = new Set(getSittingOutPlayers(sessionId));
   const queue = await storage.getQueue(sessionId);
-  let pool = queue.filter(id => !sittingOut.has(id) && !onAnyOpen.has(id));
+  let pool = queue.filter(id => !sittingOut.has(id) && !lockedIds.has(id));
 
   if (pool.length === 0) {
     console.log(`[queued-orchestrator] session=${sessionId} skipped — pool=0 (no waiting players for any case)`);
@@ -812,6 +828,21 @@ export async function runQueuedOrchestrator(
     result.filledCourtIds.forEach(id => filledCourtIds.add(id));
     if (result.usedPlayerIds.size > 0) {
       pool = pool.filter(id => !result.usedPlayerIds.has(id));
+    }
+    // Replace-in-place (task #69): for each court Claude successfully
+    // built a queued lineup for, dismiss the prior borrowed row.
+    // Courts where Claude returned no lineup keep their borrowed row.
+    for (const courtId of result.filledCourtIds) {
+      const oldBorrowedId = borrowedSuggestionByCourtId.get(courtId);
+      if (oldBorrowedId) {
+        const dismissed = await storage.dismissQueuedSuggestion(oldBorrowedId);
+        if (dismissed) {
+          console.log(
+            `[queued-orchestrator] session=${sessionId} court=${courtId} ` +
+            `replaced borrowed queued row ${oldBorrowedId} (Claude pass)`,
+          );
+        }
+      }
     }
     if (createdClaude > 0) {
       console.log(`[queued-orchestrator] session=${sessionId} created ${createdClaude}/${courtsNeedingQueued.length} queued lineup(s) via Claude`);
@@ -882,7 +913,24 @@ export async function runQueuedOrchestrator(
       // contract.) Active borrowed players are not in the pool.
       const drained = new Set(mustIncludeIds);
       pool = pool.filter(id => !drained.has(id));
+
+      // Replace-in-place (task #69): the new queued row is now live —
+      // safe to dismiss the prior borrowed row for this court. If
+      // dismiss returns undefined (CAS loser, already gone) just log.
+      const oldBorrowedId = borrowedSuggestionByCourtId.get(court.id);
+      if (oldBorrowedId) {
+        const dismissed = await storage.dismissQueuedSuggestion(oldBorrowedId);
+        if (dismissed) {
+          console.log(
+            `[queued-orchestrator] session=${sessionId} court=${court.id} ` +
+            `replaced borrowed queued row ${oldBorrowedId} (look-ahead pass)`,
+          );
+        }
+      }
     } catch (createErr) {
+      // Create failed → leave any prior borrowed row in place so the
+      // court still has SOME queued lineup. The next orchestrator run
+      // will retry.
       console.error(`[queued-orchestrator] session=${sessionId} court=${court.id} look-ahead create failed:`, createErr);
     }
   }
