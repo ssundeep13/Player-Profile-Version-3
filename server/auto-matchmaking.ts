@@ -547,21 +547,29 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
 // have one. Uses the standard bracket generator for a single court, and the
 // player-flow Claude prompt (batched, single API call) when 2+ courts need
 // queued at the same time.
-//
-// "In-play" includes BOTH 'occupied' (legacy admin assign + the canonical
-// player-driven start path in storage.startApprovedSuggestion) AND
-// 'playing' (defensive — no current write site sets it, but if a future
-// path does we still want to build a queued lineup for it). Filtering on
-// 'playing' alone is dead code per shared/schema.ts:147 — see the
-// task-64 plan for the bug history.
+
+/**
+ * Shared predicate for "this court is currently in play". Accepts BOTH
+ * 'occupied' (canonical — set by every admin assign and by the
+ * player-driven start path in storage.startApprovedSuggestion) AND
+ * 'playing' (defensive — no current write site sets this on the
+ * courts table, but if a future path does we still want to build a
+ * queued lineup for it). Filtering on 'playing' alone is dead code
+ * per the schema enum at shared/schema.ts:147 and was the root cause
+ * of task-64 (queued lineups never got built; players only ever saw
+ * the read-only projection card). Exported so the regression test
+ * exercises the exact predicate the orchestrator uses.
+ */
+export function isCourtInPlay(court: { status: string }): boolean {
+  return court.status === 'occupied' || court.status === 'playing';
+}
+
 async function runQueuedOrchestrator(
   sessionId: string,
   allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
 ): Promise<void> {
   const allCourts = await storage.getCourtsBySession(sessionId);
-  const playingCourts = allCourts.filter(
-    c => c.status === 'occupied' || c.status === 'playing',
-  );
+  const playingCourts = allCourts.filter(isCourtInPlay);
   if (playingCourts.length === 0) return;
 
   const courtsWithQueued = await getCourtsWithQueuedSuggestions(sessionId);

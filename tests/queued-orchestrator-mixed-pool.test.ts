@@ -16,8 +16,11 @@
 // already validated by the player-flow E2E (`scripts/test-e2e-self-service-loop.mjs`).
 
 import { describe, it, expect } from 'vitest';
-import { pickLineupWithMustInclude } from '../server/auto-matchmaking';
-import type { Player, Court } from '@shared/schema';
+import {
+  pickLineupWithMustInclude,
+  isCourtInPlay,
+} from '../server/auto-matchmaking';
+import type { Player } from '@shared/schema';
 
 function mkPlayer(id: string, name: string, score: number): Player {
   // Cast through unknown — Player has many DB-only fields the brain
@@ -104,21 +107,20 @@ describe('pickLineupWithMustInclude (mixed-pool Case 2/3)', () => {
   // is dead code that previously caused the queued orchestrator to
   // silently early-return, so no queued lineup ever got built and
   // /marketplace/play had to fall back to the read-only projection
-  // card. This test pins the predicate so the regression can't quietly
-  // come back.
+  // card.
+  //
+  // We import the EXACT predicate the orchestrator uses
+  // (isCourtInPlay from server/auto-matchmaking.ts) rather than
+  // re-declaring it here, so any drift in the orchestrator's filter
+  // is caught by this test. If a refactor inlines the check or
+  // narrows it again (the original bug), the import or the
+  // assertions break.
   it("treats both 'occupied' and 'playing' courts as in-play (task #64 regression guard)", () => {
-    const occupied = { status: 'occupied' } as Court;
-    const playing = { status: 'playing' } as Court;
-    const available = { status: 'available' } as Court;
-    const ended = { status: 'ended' } as unknown as Court;
-
-    const inPlayPredicate = (c: Court) =>
-      c.status === 'occupied' || c.status === 'playing';
-
-    expect(inPlayPredicate(occupied)).toBe(true);
-    expect(inPlayPredicate(playing)).toBe(true);
-    expect(inPlayPredicate(available)).toBe(false);
-    expect(inPlayPredicate(ended)).toBe(false);
+    expect(isCourtInPlay({ status: 'occupied' })).toBe(true);
+    expect(isCourtInPlay({ status: 'playing' })).toBe(true);
+    expect(isCourtInPlay({ status: 'available' })).toBe(false);
+    expect(isCourtInPlay({ status: 'ended' })).toBe(false);
+    expect(isCourtInPlay({ status: '' })).toBe(false);
   });
 
   it('handles a single sitter (pool=1, fill=3) — still includes the sitter', () => {
