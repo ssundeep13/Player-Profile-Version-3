@@ -215,6 +215,14 @@ export interface PlayerFlowCourtRequest {
   availablePlayerNames: string[];
   /** Names that MUST appear in this court's 4-player lineup (0..3). */
   mustIncludeNames: string[];
+  /**
+   * Optional — names of players currently PLAYING on this court right now.
+   * Used by the queued-orchestrator's look-ahead path: these names are also
+   * present in `availablePlayerNames`, but the prompt distinguishes them so
+   * Claude understands that picking one means borrowing from the in-play
+   * roster (preferred only when it materially improves balance).
+   */
+  activeRosterNames?: string[];
 }
 
 export interface PlayerFlowMatchmakingResponse {
@@ -249,10 +257,14 @@ export function buildPlayerFlowMatchmakingPrompt(
       const mustInclude = req.mustIncludeNames.length > 0
         ? req.mustIncludeNames.join(', ')
         : '(none)';
+      const activeLine = req.activeRosterNames && req.activeRosterNames.length > 0
+        ? `\n    currently playing on this court (borrow only if it materially improves skill balance): ${req.activeRosterNames.join(', ')}`
+        : '';
       return (
         `- Court ${req.courtNumber}\n` +
         `    available: ${req.availablePlayerNames.join(', ')}\n` +
-        `    must include: ${mustInclude}`
+        `    must include: ${mustInclude}` +
+        activeLine
       );
     })
     .join('\n');

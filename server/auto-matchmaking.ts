@@ -55,6 +55,14 @@ const PENDING_WINDOW_MS = 90_000;
 const FIRST_MATCH_THRESHOLD = 6;
 const SUBSEQUENT_MATCH_THRESHOLD = 4;
 
+// Skill-gap threshold above which the queued-orchestrator's look-ahead
+// pass will consider borrowing 1-2 players from the in-play court roster
+// to balance the next-round 2v2. Below this gap, the pure-waiting lineup
+// is considered "good enough" and active players are not pulled in. Tuned
+// to ~half a tier band — gaps below 5 are imperceptible to most players,
+// gaps above feel unfair.
+const UNBALANCED_GAP_THRESHOLD = 5.0;
+
 // Structured event side-channel. The on-disk workflow log is a
 // platform-managed snapshot (not live-tailed), so the E2E test cannot rely
 // on it for path/timing verification. Instead, every meaningful matchmaking
@@ -331,7 +339,7 @@ export function pickLineupWithMustInclude(
   allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
 ): Lineup | null {
   const need = 4 - mustIncludeIds.length;
-  if (need <= 0 || need > fillFromIds.length) return null;
+  if (need < 0 || need > fillFromIds.length) return null;
 
   const playersById = new Map(allPlayers.map(p => [p.id, p]));
   const mustInclude: Player[] = [];
@@ -340,6 +348,20 @@ export function pickLineupWithMustInclude(
     if (!p) return null;
     mustInclude.push(p);
   }
+
+  // need === 0 → all 4 slots are mustInclude. Just evaluate the 3 team
+  // permutations of those 4 directly. Used by pickLineupWithLookahead's
+  // pure-waiting branch when the partition assigns all 4 slots to waiters.
+  if (need === 0) {
+    const ranked = findBalancedTeams(mustInclude, 1, false, sessionId);
+    const top = ranked[0];
+    if (!top) return null;
+    return {
+      team1Ids: top.team1.map(p => p.id),
+      team2Ids: top.team2.map(p => p.id),
+    };
+  }
+
   const fillCandidates: Player[] = [];
   for (const id of fillFromIds) {
     const p = playersById.get(id);
@@ -388,6 +410,105 @@ export function pickLineupWithMustInclude(
 
   if (!best) return null;
   return { team1Ids: best.team1Ids, team2Ids: best.team2Ids };
+}
+
+// ─── Look-ahead helpers (Task #65 — Balanced Queued Look-Ahead) ─────────────
+
+/** Average team1 score − average team2 score (absolute). */
+export function computeLineupSkillGap(
+  lineup: Lineup,
+  allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
+): number {
+  const map = new Map(allPlayers.map(p => [p.id, p]));
+  const score = (id: string) => map.get(id)?.skillScore ?? 90;
+  const t1 = lineup.team1Ids.reduce((s, id) => s + score(id), 0) / Math.max(1, lineup.team1Ids.length);
+  const t2 = lineup.team2Ids.reduce((s, id) => s + score(id), 0) / Math.max(1, lineup.team2Ids.length);
+  return Math.abs(t1 - t2);
+}
+
+/**
+ * Round-robin partition the waiting `pool` (queue order, longest-waited
+ * first) across the given courts so each waiter is assigned to exactly
+ * one court. Each court is capped at 4 mustInclude players; any waiters
+ * beyond `4 * courts.length` are left unassigned (they remain in the pool
+ * for the next orchestrator pass). Pure function — exported for tests.
+ */
+export function partitionWaitersAcrossCourts(
+  pool: string[],
+  courtIds: string[],
+): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const id of courtIds) out.set(id, []);
+  if (courtIds.length === 0) return out;
+  for (let i = 0; i < pool.length; i++) {
+    const courtId = courtIds[i % courtIds.length];
+    const arr = out.get(courtId)!;
+    if (arr.length < 4) arr.push(pool[i]);
+  }
+  return out;
+}
+
+/**
+ * Build the best-balanced 2v2 queued lineup for one court while
+ * **always force-including every player in `mustIncludeIds`** (the waiters
+ * partitioned to this court). Considers two plans and picks whichever has
+ * the smaller skill gap, with a preference for pure-waiting when balanced:
+ *
+ *   • Plan A — pure waiting: fill the remaining slots from
+ *     `optionalWaitingIds` only. May be `null` when there aren't enough
+ *     waiters to make 4.
+ *   • Plan B — borrow: also allow `activeRosterIds` (the 4 players
+ *     currently playing on this court) to fill the remaining slots. Only
+ *     evaluated when Plan A is missing or its skill gap is ≥
+ *     `gapThreshold` (default `UNBALANCED_GAP_THRESHOLD`).
+ *
+ * Returns `{ lineup, includesActive, skillGap }` so the orchestrator can
+ * tag the resulting `match_suggestions` row with the right
+ * `includesActivePlayers` flag (needed by the game-end transition's
+ * re-verify step in `tryFlipQueuedToPendingForCourt`).
+ */
+export function pickLineupWithLookahead(
+  sessionId: string,
+  mustIncludeIds: string[],
+  optionalWaitingIds: string[],
+  activeRosterIds: string[],
+  allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
+  options: { gapThreshold?: number } = {},
+): { lineup: Lineup; includesActive: boolean; skillGap: number } | null {
+  const threshold = options.gapThreshold ?? UNBALANCED_GAP_THRESHOLD;
+  const waitingSet = new Set([...mustIncludeIds, ...optionalWaitingIds]);
+  const isActive = (id: string) => !waitingSet.has(id);
+
+  // Plan A — pure waiting only.
+  const planA = pickLineupWithMustInclude(sessionId, mustIncludeIds, optionalWaitingIds, allPlayers);
+  const planAGap = planA ? computeLineupSkillGap(planA, allPlayers) : Infinity;
+
+  if (planA && planAGap < threshold) {
+    return { lineup: planA, includesActive: false, skillGap: planAGap };
+  }
+
+  // Plan B — allow borrowing from this court's active roster. Only worth
+  // running when there's at least one slot to borrow into. (When
+  // mustIncludeIds.length === 4 there is no slot, so Plan B reduces to
+  // Plan A — bail early to avoid wasted work.)
+  if (mustIncludeIds.length < 4 && activeRosterIds.length > 0) {
+    const fill = [...optionalWaitingIds, ...activeRosterIds];
+    const planB = pickLineupWithMustInclude(sessionId, mustIncludeIds, fill, allPlayers);
+    if (planB) {
+      const planBGap = computeLineupSkillGap(planB, allPlayers);
+      const planBUsesActive =
+        planB.team1Ids.some(isActive) || planB.team2Ids.some(isActive);
+
+      // Take Plan B when it strictly beats Plan A (or Plan A doesn't exist).
+      // The 0.01 epsilon matches pickLineupWithMustInclude's tie-break.
+      if (!planA || planBGap < planAGap - 0.01) {
+        return { lineup: planB, includesActive: planBUsesActive, skillGap: planBGap };
+      }
+    }
+  }
+
+  if (planA) return { lineup: planA, includesActive: false, skillGap: planAGap };
+  return null;
 }
 
 export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
@@ -592,18 +713,28 @@ async function runQueuedOrchestrator(
   }
 
   // Tracks which courts have a queued lineup created this run, so each
-  // subsequent pass (Claude → standard pure-pool → mixed pool) only
-  // touches courts still missing one.
+  // subsequent pass (Claude → per-court look-ahead) only touches courts
+  // still missing one.
   const filledCourtIds = new Set<string>();
 
-  // ── Case 1 (pure waiting pool) ──────────────────────────────────────────
-  // Multi-court Claude path. Only used when 2+ courts need queued AND we
-  // have enough players to fill at least 2 lineups (8 players).
+  // Pre-fetch per-court active rosters once so we can pass them into BOTH
+  // the Claude batch (so Claude can borrow across courts when it helps
+  // balance) and the per-court look-ahead pass below.
+  const activeRosterByCourtId = new Map<string, string[]>();
+  for (const c of courtsNeedingQueued) {
+    activeRosterByCourtId.set(c.id, await storage.getCourtPlayers(c.id));
+  }
+
+  // ── Multi-court Claude batch ────────────────────────────────────────────
+  // Only used when 2+ courts need queued AND we have enough players to
+  // fill at least 2 lineups (8 players). Even with the new look-ahead,
+  // having the AI consider all courts simultaneously can produce a more
+  // globally-balanced split than the per-court greedy pass below.
   const useClaude = courtsNeedingQueued.length >= 2 && pool.length >= 8 && !!process.env.ANTHROPIC_API_KEY;
 
   let createdClaude = 0;
   if (useClaude) {
-    const result = await tryClaudeQueuedBatch(sessionId, courtsNeedingQueued, pool, allPlayers);
+    const result = await tryClaudeQueuedBatch(sessionId, courtsNeedingQueued, pool, activeRosterByCourtId, allPlayers);
     createdClaude = result.created;
     result.filledCourtIds.forEach(id => filledCourtIds.add(id));
     if (result.usedPlayerIds.size > 0) {
@@ -614,55 +745,49 @@ async function runQueuedOrchestrator(
     }
   }
 
-  // Standard pure-pool generator: covers single-court runs, Claude-skipped
-  // runs, AND any courts Claude couldn't fill in a partial response.
-  let createdStd = 0;
-  for (const court of courtsNeedingQueued) {
-    if (filledCourtIds.has(court.id)) continue;
-    if (pool.length < 4) break;
-    const lineup = pickStandardLineup(sessionId, pool, allPlayers);
-    if (!lineup) break;
-    try {
-      await storage.createMatchSuggestion({
-        sessionId,
-        courtId: court.id,
-        pendingUntil: null,
-        status: 'queued',
-        includesActivePlayers: false,
-        players: [
-          ...lineup.team1Ids.map(id => ({ playerId: id, team: 1 as const })),
-          ...lineup.team2Ids.map(id => ({ playerId: id, team: 2 as const })),
-        ],
-      });
-      createdStd++;
-      filledCourtIds.add(court.id);
-      const usedIds = new Set([...lineup.team1Ids, ...lineup.team2Ids]);
-      pool = pool.filter(id => !usedIds.has(id));
-    } catch (createErr) {
-      console.error(`[queued-orchestrator] session=${sessionId} court=${court.id} create failed:`, createErr);
-    }
-  }
-  if (createdStd > 0) {
-    console.log(`[queued-orchestrator] session=${sessionId} created ${createdStd} queued lineup(s) via standard generator`);
-  }
+  // ── Per-court look-ahead pass (Task #65) ────────────────────────────────
+  // Replaces the old Case 1 (pure-pool standard generator) + Case 2/3
+  // (mixed-pool with all of pool as must-include) with a single unified
+  // pass that:
+  //   1. Partitions the remaining pool round-robin across the courts that
+  //      still need a queued lineup. This guarantees every waiter is
+  //      assigned to exactly one court (longest-waited first via FIFO
+  //      queue order), so a low-skill waiter can never be skipped just
+  //      because a stronger active player would balance the lineup
+  //      better.
+  //   2. For each court, calls pickLineupWithLookahead with that court's
+  //      mustInclude (its partition) and its own active roster as borrow
+  //      candidates. The helper returns a pure-waiting lineup when
+  //      balanced and a mixed lineup with includesActivePlayers=true
+  //      when borrowing improves the gap.
+  const remainingCourts = courtsNeedingQueued.filter(c => !filledCourtIds.has(c.id));
+  const partition = partitionWaitersAcrossCourts(pool, remainingCourts.map(c => c.id));
 
-  // ── Case 2/3 (waiting pool 1-3 → mix in this court's active players) ───
-  // For each remaining court, force-include every still-waiting player
-  // and fill the remaining slots from THAT court's currently-playing
-  // roster. The waiting pool is shared across courts so we drain it as
-  // we go; active rosters are per-court so they aren't tracked across
-  // iterations. includesActivePlayers=true so the game-end transition
-  // re-verifies eligibility before flipping queued→pending.
+  let createdLookahead = 0;
   let createdMixed = 0;
-  for (const court of courtsNeedingQueued) {
-    if (filledCourtIds.has(court.id)) continue;
-    if (pool.length === 0 || pool.length >= 4) continue;
+  for (const court of remainingCourts) {
+    const mustIncludeIds = partition.get(court.id) ?? [];
+    // mustInclude.length === 0 → no waiters partitioned to this court
+    // (pool exhausted before we got here). Case 0 (all-active borrowed
+    // lineup) is out of scope per the task plan, so skip.
+    if (mustIncludeIds.length === 0) continue;
 
-    const courtPlayerIds = await storage.getCourtPlayers(court.id);
-    if (courtPlayerIds.length < 4 - pool.length) continue;
+    const activeRosterIds = activeRosterByCourtId.get(court.id) ?? [];
 
-    const lineup = pickLineupWithMustInclude(sessionId, pool, courtPlayerIds, allPlayers);
-    if (!lineup) continue;
+    const result = pickLineupWithLookahead(
+      sessionId,
+      mustIncludeIds,
+      [], // partitioning already assigned every waiter to exactly one court
+      activeRosterIds,
+      allPlayers,
+    );
+    if (!result) {
+      console.log(
+        `[queued-orchestrator] session=${sessionId} court=${court.id} ` +
+        `look-ahead skipped — must=${mustIncludeIds.length} active=${activeRosterIds.length} (no viable lineup)`,
+      );
+      continue;
+    }
 
     try {
       await storage.createMatchSuggestion({
@@ -670,26 +795,29 @@ async function runQueuedOrchestrator(
         courtId: court.id,
         pendingUntil: null,
         status: 'queued',
-        includesActivePlayers: true,
+        includesActivePlayers: result.includesActive,
         players: [
-          ...lineup.team1Ids.map(id => ({ playerId: id, team: 1 as const })),
-          ...lineup.team2Ids.map(id => ({ playerId: id, team: 2 as const })),
+          ...result.lineup.team1Ids.map(id => ({ playerId: id, team: 1 as const })),
+          ...result.lineup.team2Ids.map(id => ({ playerId: id, team: 2 as const })),
         ],
       });
-      createdMixed++;
+      createdLookahead++;
+      if (result.includesActive) createdMixed++;
       filledCourtIds.add(court.id);
-      // Drain ONLY the waiting players from the shared pool. The active
-      // court players we mixed in are not in the pool to begin with.
-      const waitingSet = new Set(pool);
-      const lineupIds = [...lineup.team1Ids, ...lineup.team2Ids];
-      const consumedWaiting = new Set(lineupIds.filter(id => waitingSet.has(id)));
-      pool = pool.filter(id => !consumedWaiting.has(id));
+      // Drain every must-include waiter from the pool. (All mustIncludes
+      // are guaranteed to be in the lineup by pickLineupWithMustInclude's
+      // contract.) Active borrowed players are not in the pool.
+      const drained = new Set(mustIncludeIds);
+      pool = pool.filter(id => !drained.has(id));
     } catch (createErr) {
-      console.error(`[queued-orchestrator] session=${sessionId} court=${court.id} mixed-pool create failed:`, createErr);
+      console.error(`[queued-orchestrator] session=${sessionId} court=${court.id} look-ahead create failed:`, createErr);
     }
   }
-  if (createdMixed > 0) {
-    console.log(`[queued-orchestrator] session=${sessionId} created ${createdMixed} queued lineup(s) via mixed-pool generator (Case 2/3, includesActivePlayers=true)`);
+  if (createdLookahead > 0) {
+    console.log(
+      `[queued-orchestrator] session=${sessionId} created ${createdLookahead} queued lineup(s) via look-ahead ` +
+      `(${createdMixed} with includesActivePlayers=true, ${createdLookahead - createdMixed} pure waiting)`,
+    );
   }
 }
 
@@ -697,11 +825,23 @@ async function tryClaudeQueuedBatch(
   sessionId: string,
   courtsNeedingQueued: Awaited<ReturnType<typeof storage.getCourtsBySession>>,
   pool: string[],
+  activeRosterByCourtId: Map<string, string[]>,
   allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
 ): Promise<{ created: number; filledCourtIds: Set<string>; usedPlayerIds: Set<string> }> {
   const poolIdSet = new Set(pool);
   const poolPlayers = allPlayers.filter(p => poolIdSet.has(p.id));
-  const playersById = new Map(poolPlayers.map(p => [p.id, p]));
+
+  // Build the candidate set: pool + every court's active roster, so the
+  // prompt can reference active borrow candidates and resolveTeam below
+  // can validate them. Active players from one court are NOT eligible for
+  // a different court's lineup (each court request lists only its own
+  // pool ∪ activeRoster as available).
+  const allActiveIds = new Set<string>();
+  for (const ids of activeRosterByCourtId.values()) {
+    for (const id of ids) allActiveIds.add(id);
+  }
+  const candidatePlayers = allPlayers.filter(p => poolIdSet.has(p.id) || allActiveIds.has(p.id));
+  const candidatesById = new Map(candidatePlayers.map(p => [p.id, p]));
 
   // Recent partners/opponents for richer prompts.
   const history = await storage.getSessionGameParticipants(sessionId);
@@ -709,7 +849,7 @@ async function tryClaudeQueuedBatch(
   const nameById = new Map(allPlayers.map(p => [p.id, p.name]));
   const playerIdByLowerName = new Map(allPlayers.map(p => [p.name.toLowerCase(), p.id]));
 
-  const profiles: PlayerFlowPlayerProfile[] = poolPlayers.map(p => {
+  const profiles: PlayerFlowPlayerProfile[] = candidatePlayers.map(p => {
     const rs = getPlayerRestState(sessionId, p.id);
     const recent = recentMap.get(p.id) ?? { partners: [], opponents: [] };
     return {
@@ -724,11 +864,40 @@ async function tryClaudeQueuedBatch(
     };
   });
 
-  const courtRequests: PlayerFlowCourtRequest[] = courtsNeedingQueued.map((c, idx) => ({
-    courtNumber: idx + 1,
-    availablePlayerNames: poolPlayers.map(p => p.name),
-    mustIncludeNames: [],
-  }));
+  // Pre-partition the waiting pool across courts (round-robin, longest-
+  // waited first via FIFO order) and pass each court's share as
+  // mustIncludeNames. This mirrors the per-court look-ahead pass and is
+  // the contract that guarantees no waiter is silently dropped by Claude
+  // in favour of a borrowed active player when enough waiters exist to
+  // fill every court (Task #65 invariant).
+  //
+  // Per-court availability list = THIS court's mustInclude waiters ∪
+  // THIS court's active roster. Other courts' partitioned waiters are
+  // intentionally excluded so Claude can never re-pick a waiter that has
+  // already been assigned to another court — the prompt's "appear in
+  // ONE court only" rule then has nothing to violate.
+  const claudePartition = partitionWaitersAcrossCourts(
+    pool,
+    courtsNeedingQueued.map(c => c.id),
+  );
+  const allowedIdsByCourtId = new Map<string, Set<string>>();
+  const courtRequests: PlayerFlowCourtRequest[] = courtsNeedingQueued.map((c, idx) => {
+    const mustIds = claudePartition.get(c.id) ?? [];
+    const activeIds = activeRosterByCourtId.get(c.id) ?? [];
+    const allowedIds = new Set<string>([...mustIds, ...activeIds]);
+    allowedIdsByCourtId.set(c.id, allowedIds);
+    const mustNames = mustIds.map(id => nameById.get(id) ?? '').filter(Boolean);
+    const activeNames = activeIds.map(id => nameById.get(id) ?? '').filter(Boolean);
+    // availablePlayerNames is the union (must ∪ active) — the prompt
+    // distinguishes the must-include subset separately.
+    const availableNames = Array.from(new Set<string>([...mustNames, ...activeNames]));
+    return {
+      courtNumber: idx + 1,
+      availablePlayerNames: availableNames,
+      mustIncludeNames: mustNames,
+      activeRosterNames: activeNames,
+    };
+  });
 
   const startedAt = Date.now();
   let parsed: Awaited<ReturnType<typeof requestPlayerFlowMatchmaking>>;
@@ -748,11 +917,15 @@ async function tryClaudeQueuedBatch(
     const sug = parsed.suggestions[i];
     if (!sug || !Array.isArray(sug.team1) || !Array.isArray(sug.team2)) continue;
 
+    const allowedForCourt = allowedIdsByCourtId.get(court.id) ?? new Set<string>();
     const resolveTeam = (team: { name: string }[]): string[] | null => {
       const ids: string[] = [];
       for (const raw of team) {
         const id = playerIdByLowerName.get(raw.name.toLowerCase());
-        if (!id || !playersById.has(id) || usedIds.has(id)) return null;
+        // Reject unknown names, players not allowed for this court (waiting
+        // pool ∪ this court's active roster), or already-used players from
+        // an earlier court in this batch.
+        if (!id || !candidatesById.has(id) || !allowedForCourt.has(id) || usedIds.has(id)) return null;
         ids.push(id);
       }
       return ids;
@@ -764,13 +937,20 @@ async function tryClaudeQueuedBatch(
     const all4 = new Set([...t1, ...t2]);
     if (all4.size !== 4) continue;
 
+    // includesActivePlayers = true when the lineup pulls in any player who
+    // wasn't in the waiting pool at orchestrator-time. The game-end
+    // transition's re-verify (tryFlipQueuedToPendingForCourt) uses this
+    // flag to decide whether to confirm eligibility before flipping
+    // queued → pending.
+    const lineupIncludesActive = [...all4].some(id => !poolIdSet.has(id));
+
     try {
       await storage.createMatchSuggestion({
         sessionId,
         courtId: court.id,
         pendingUntil: null,
         status: 'queued',
-        includesActivePlayers: false,
+        includesActivePlayers: lineupIncludesActive,
         players: [
           ...t1.map(id => ({ playerId: id, team: 1 as const })),
           ...t2.map(id => ({ playerId: id, team: 2 as const })),
@@ -778,7 +958,10 @@ async function tryClaudeQueuedBatch(
       });
       created++;
       filledCourtIds.add(court.id);
-      all4.forEach(id => usedIds.add(id));
+      // Only drain WAITING pool members from the shared usedIds set —
+      // active players borrowed from a court roster aren't in the pool to
+      // begin with and shouldn't block other courts in this batch.
+      all4.forEach(id => { if (poolIdSet.has(id)) usedIds.add(id); });
     } catch (createErr) {
       console.error(`[queued-orchestrator] session=${sessionId} court=${court.id} Claude-row create failed:`, createErr);
     }
