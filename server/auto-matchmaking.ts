@@ -513,9 +513,11 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
         emitEvent({ type: 'done', sessionId, created: suggestionsCreated, firstMatch, ts: Date.now() });
       }
 
-      // Second pass: queued orchestrator. For every court currently in
-      // 'playing' status that does not already have a 'queued' next-round
-      // lineup, build one so the Court Captain panel can show "Up next"
+      // Second pass: queued orchestrator. For every court currently
+      // in-play (status 'occupied' — canonical — or 'playing'
+      // defensively; see isCourtInPlay below) that does not already
+      // have a 'queued' next-round lineup, build one so the Court
+      // Captain panel can show "Up next"
       // and the next-round transition is instantaneous when the score is
       // submitted. ALWAYS runs (even when the pending pass above was
       // skipped) — that's the whole point of eager queued generation
