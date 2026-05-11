@@ -3272,7 +3272,8 @@ export function registerMarketplaceRoutes(app: Express) {
         const user = await storage.getMarketplaceUser(userId);
         const linkedPlayerId = user?.linkedPlayerId ?? null;
         if (!linkedPlayerId) {
-          return res.json({ suggestion: null });
+          // Stable shape — see projection branch further down.
+          return res.json({ suggestion: null, projection: null });
         }
 
         // Opt-in surface for the P8 score-entry screen. Other consumers
@@ -3436,7 +3437,49 @@ export function registerMarketplaceRoutes(app: Express) {
         }
 
         if (!parent) {
-          return res.json({ suggestion: null });
+          // Projection fallback — when the player has no live suggestion
+          // (queued lineup hasn't been built yet, or there genuinely
+          // aren't enough players to mix into one), surface a small
+          // read-only projection so the WaitingScreen can show
+          // "You're #N — likely up on Court X" instead of the bare
+          // "Finding your next game…" spinner. READ-ONLY: this branch
+          // never writes to match_suggestions.
+          let projection: {
+            queuePosition: number;
+            projectedCourtId: string;
+            projectedCourtName: string;
+          } | null = null;
+          try {
+            const activeSession = await storage.getActiveSession();
+            if (activeSession) {
+              const queue = await storage.getQueue(activeSession.id);
+              const idx = queue.indexOf(linkedPlayerId);
+              if (idx >= 0) {
+                const allCourts = await storage.getCourtsBySession(activeSession.id);
+                // Match the today-stats endpoint, which treats 'occupied'
+                // as the in-play state. Pick the court whose game started
+                // longest ago (i.e., the one most likely to free up first).
+                const playingCourts = allCourts
+                  .filter(c => c.status === 'occupied' || c.status === 'playing')
+                  .sort((a, b) => {
+                    const at = a.startedAt ? a.startedAt.getTime() : Number.MAX_SAFE_INTEGER;
+                    const bt = b.startedAt ? b.startedAt.getTime() : Number.MAX_SAFE_INTEGER;
+                    return at - bt;
+                  });
+                if (playingCourts.length > 0) {
+                  const projCourt = playingCourts[0];
+                  projection = {
+                    queuePosition: idx + 1,
+                    projectedCourtId: projCourt.id,
+                    projectedCourtName: projCourt.name,
+                  };
+                }
+              }
+            }
+          } catch (projErr) {
+            console.error('[current-suggestion] projection lookup failed:', projErr);
+          }
+          return res.json({ suggestion: null, projection });
         }
 
         // Batched joins: court name (and startedAt for the playing-screen

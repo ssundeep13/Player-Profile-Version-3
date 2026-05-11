@@ -73,8 +73,20 @@ interface TodayStatsResponse {
   lastGame: LastGameSummary | null;
 }
 
+interface NextGameProjection {
+  queuePosition: number;
+  projectedCourtId: string;
+  projectedCourtName: string;
+}
+
 interface CurrentSuggestionResponse {
   suggestion: CurrentSuggestion | null;
+  // Server-derived read-only fallback used by the WaitingScreen when the
+  // player has no live suggestion yet but they ARE in the queue with a
+  // court in play. Surfaces "you're #N — likely up on Court X" instead
+  // of the bare "Finding your next game…" spinner. Never includes any
+  // partner names — there is no real lineup yet.
+  projection?: NextGameProjection | null;
 }
 
 interface CheckedInResponse {
@@ -352,6 +364,7 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
   });
 
   const suggestion = suggestionQuery.data?.suggestion ?? null;
+  const projection = suggestionQuery.data?.projection ?? null;
 
   // Court-ready alert: chime + vibrate + title rewrite + in-page banner on
   // pending → approved. Split into two effects so the banner-hide timer
@@ -467,7 +480,11 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
       <CourtsInPlayStrip courts={stats?.courtsInPlay ?? []} />
 
       {!suggestion || suggestion.status === 'dismissed' ? (
-        <FindingNextGameCard />
+        projection ? (
+          <ProjectionCard projection={projection} />
+        ) : (
+          <FindingNextGameCard />
+        )
       ) : suggestion.status === 'queued' ? (
         <OnDeckCard suggestion={suggestion} />
       ) : (
@@ -728,6 +745,54 @@ function OnDeckCard({ suggestion }: { suggestion: CurrentSuggestion }) {
           <div className="text-center text-xs uppercase tracking-wider text-muted-foreground">vs</div>
           <TeamRow label="Opponents" players={opponents} accent={NAVY} testId="team-opponents" />
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Read-only "you're up next-ish" card. Renders only when:
+//   • there is no live suggestion for the player (no pending/approved/
+//     queued/playing row), AND
+//   • the server returned a `projection` payload (the player is in the
+//     queue and at least one court is in play)
+// Deliberately shows NO team rows and NO time estimate — there is no
+// real lineup yet, just a positional projection. Copy is fixed by the
+// task spec; please don't add an ETA back in.
+function ProjectionCard({ projection }: { projection: NextGameProjection }) {
+  const courtLabel = stripCourtPrefix(projection.projectedCourtName) || '—';
+  const isNext = projection.queuePosition === 1;
+  return (
+    <Card data-testid="card-projection">
+      <CardContent className="py-6 text-center space-y-3">
+        <p className="text-xs uppercase tracking-wider" style={{ color: TEAL }}>
+          Up next
+        </p>
+        <h2
+          className="text-xl font-semibold"
+          style={{ color: NAVY }}
+          data-testid="text-projection-heading"
+        >
+          {isNext ? (
+            <>
+              You're next on{' '}
+              <span style={{ color: TEAL }} data-testid="text-projection-court">
+                Court {courtLabel}
+              </span>{' '}
+              — waiting for the current game to end
+            </>
+          ) : (
+            <>
+              You're #{projection.queuePosition} in the queue — you'll be up on{' '}
+              <span style={{ color: TEAL }} data-testid="text-projection-court">
+                Court {courtLabel}
+              </span>{' '}
+              soon
+            </>
+          )}
+        </h2>
+        <p className="text-xs text-muted-foreground" data-testid="text-projection-helper">
+          You'll be notified when your game is ready.
+        </p>
       </CardContent>
     </Card>
   );

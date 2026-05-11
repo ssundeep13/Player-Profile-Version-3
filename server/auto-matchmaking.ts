@@ -404,27 +404,28 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
 
       // Hydrate rest states + partner history from completed games so the
       // standard generator and the Claude prompt both see the right
-      // gamesThisSession / gamesWaited / partner history.
+      // gamesThisSession / gamesWaited / partner history. Always loaded
+      // here so BOTH passes (pending + queued) have the same view.
       await loadRestStatesFromDb(sessionId);
       const history = await storage.getSessionGameParticipants(sessionId);
       const queue = await storage.getQueue(sessionId);
       buildRestStatesFromHistory(sessionId, history, queue);
       buildPartnerHistoryFromHistory(sessionId, history);
 
+      const allPlayers = await storage.getAllPlayers();
+
+      // ── First pass: pending lineups for available courts ───────────────
+      // May skip (pool below threshold, no available courts) — that's
+      // fine. The queued pass below STILL runs in those cases so a
+      // player who checked in mid-game (every court already playing)
+      // still gets a queued lineup built for them eagerly, and
+      // courts-in-play get next-round lineups even before any game ends.
+      let suggestionsCreated = 0;
+      let pendingSkipReason: string | null = null;
+
       const sittingOut = new Set(getSittingOutPlayers(sessionId));
       const onInFlight = await getPlayersOnInFlightSuggestions(sessionId);
-
-      // Waiting pool: queue order preserved (so the standard generator's
-      // queue-priority logic matches the live admin endpoint), filtered to
-      // players who can actually be assigned right now.
       let pool = queue.filter(id => !sittingOut.has(id) && !onInFlight.has(id));
-
-      if (pool.length < threshold) {
-        const reason = `pool=${pool.length} < threshold=${threshold} (firstMatch=${firstMatch})`;
-        console.log(`[auto-matchmaking] session=${sessionId} skipped — ${reason}`);
-        emitEvent({ type: 'skipped', sessionId, reason, ts: Date.now() });
-        return;
-      }
 
       const courts = await storage.getCourtsBySession(sessionId);
       const courtsWithInFlight = await getCourtsWithInFlightSuggestions(sessionId);
@@ -432,18 +433,19 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
         c => c.status === 'available' && !courtsWithInFlight.has(c.id),
       );
 
-      if (availableCourts.length === 0) {
-        const reason = 'no available courts';
-        console.log(`[auto-matchmaking] session=${sessionId} skipped — ${reason}`);
-        emitEvent({ type: 'skipped', sessionId, reason, ts: Date.now() });
-        return;
+      if (pool.length < threshold) {
+        pendingSkipReason = `pool=${pool.length} < threshold=${threshold} (firstMatch=${firstMatch})`;
+      } else if (availableCourts.length === 0) {
+        pendingSkipReason = 'no available courts';
       }
 
-      const allPlayers = await storage.getAllPlayers();
+      if (pendingSkipReason) {
+        console.log(`[auto-matchmaking] session=${sessionId} pending pass skipped — ${pendingSkipReason}`);
+        emitEvent({ type: 'skipped', sessionId, reason: pendingSkipReason, ts: Date.now() });
+      }
 
       let iterationIndex = 0;
-      let suggestionsCreated = 0;
-      while (pool.length >= 4 && availableCourts.length > 0) {
+      while (!pendingSkipReason && pool.length >= 4 && availableCourts.length > 0) {
         const isVeryFirstIteration = iterationIndex === 0 && firstMatch;
         const court = availableCourts.shift()!;
 
@@ -503,17 +505,21 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
         iterationIndex++;
       }
 
-      console.log(
-        `[auto-matchmaking] session=${sessionId} done — ` +
-        `created=${suggestionsCreated} firstMatch=${firstMatch}`,
-      );
-      emitEvent({ type: 'done', sessionId, created: suggestionsCreated, firstMatch, ts: Date.now() });
+      if (!pendingSkipReason) {
+        console.log(
+          `[auto-matchmaking] session=${sessionId} pending pass done — ` +
+          `created=${suggestionsCreated} firstMatch=${firstMatch}`,
+        );
+        emitEvent({ type: 'done', sessionId, created: suggestionsCreated, firstMatch, ts: Date.now() });
+      }
 
       // Second pass: queued orchestrator. For every court currently in
       // 'playing' status that does not already have a 'queued' next-round
       // lineup, build one so the Court Captain panel can show "Up next"
       // and the next-round transition is instantaneous when the score is
-      // submitted.
+      // submitted. ALWAYS runs (even when the pending pass above was
+      // skipped) — that's the whole point of eager queued generation
+      // for players who checked in while every court is busy.
       //
       // Handles Case 1 (pool >= 4 → pure waiting players) and Case 2/3
       // (pool 1-3 → mix in this court's currently-playing roster). When
