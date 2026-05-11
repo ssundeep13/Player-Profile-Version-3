@@ -1,0 +1,55 @@
+Based on real session testing, we need to change how queued suggestions are built when all waiting players have similar skill levels.
+The problem:
+With 12 players, 2 courts, 4 waiting:
+
+Court 1 playing: P1+P2 vs P3+P4 (higher skill)
+Court 2 playing: P5+P6 vs P7+P8 (higher skill)
+Waiting: P9+P10+P11+P12 (all lower skill)
+
+Current behaviour: queued suggestions use P9-P12 together → two weak unbalanced games.
+Desired behaviour: rotate players from current courts into the next round to create balanced games:
+
+Court 1 next: P9 + P1 vs P10 + P3 (waiting player gets stronger partner)
+Court 2 next: P11 + P5 vs P12 + P7 (waiting player gets stronger partner)
+
+The rule:
+When building queued suggestions, always consider ALL players — waiting AND currently playing — and use the matchmaking algorithm to find the most balanced possible 4-player lineup for each court's next game.
+The priority order for who plays next:
+
+Players who have been waiting longest must be included — they are must-include
+Fill remaining slots with players from the current court who have played the most consecutive games (rotating them off)
+Players who just won their game get lower priority for the next round
+Always optimise for skill balance across the two teams
+
+Updated queued suggestion logic:
+FOR each occupied court:
+
+  Must-include: all waiting players (sorted by wait time, longest first)
+  
+  IF waiting players >= 4:
+    Check if pure waiting pool produces a balanced game (skill gap < 5 points)
+    IF balanced → use pure waiting pool (existing behaviour)
+    IF unbalanced → run look-ahead:
+      Try swapping 1-2 waiting players with on-court players
+      Pick the combination with lowest skill gap between teams
+      Flag as includesActivePlayers = true
+  
+  IF waiting players < 4:
+    Use existing mixed pool logic (Case 2/3) — already built
+Important constraints:
+
+Waiting players are ALWAYS included in the next game — never skip someone who has been waiting
+On-court players being pulled into a queued suggestion are still playing their current game — they are not removed from it
+The existing tryFlipQueuedToPendingForCourt re-validation still applies — if any player is no longer available when the court frees up, dismiss and re-matchmake
+Use Claude AI for this calculation when 2+ courts need queued suggestions simultaneously (already built)
+Flag the suggestion with includesActivePlayers = true when any current-court player is included
+
+Test scenarios:
+
+12 players, 2 courts, 4 waiting all low skill → queued suggestions mix waiting + active players for balance, NOT pure waiting pool
+12 players, 2 courts, 4 waiting with mixed skills → pure waiting pool used if balanced, mixed if not
+Waiting players are always included — never skipped for an active player
+Players who just won get lower priority for next round
+Existing pure-waiting Case 1 still works when pool is already balanced
+
+Report back with all 5 scenarios as pass or fail.
