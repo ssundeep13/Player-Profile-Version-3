@@ -19,6 +19,7 @@ import {
   pickLineupWithLookahead,
   partitionWaitersAcrossCourts,
   computeLineupSkillGap,
+  validateClaudeMustIncludes,
 } from '../server/auto-matchmaking';
 import type { Player } from '@shared/schema';
 
@@ -162,20 +163,50 @@ describe('Task #65 — Balanced queued look-ahead', () => {
   });
 
   // ── Scenario 4 ────────────────────────────────────────────────────────
-  it('S4: player who just won (back of queue) is NOT picked over longer-waiting candidates', () => {
-    // FIFO queue order is the rest-state proxy: a player who just won
-    // gets re-added at the BACK of the queue (high index = short wait =
-    // high gamesThisSession), so the partition's round-robin picks
-    // longest-waiters first. No new "just-won" penalty in the look-ahead
-    // — the existing FIFO ordering carries the signal.
+  it('S4: rest-state — recent winner at queue back is force-skipped even when balance would prefer them', () => {
+    // Rest-state intent: a player who just won is re-queued at the back
+    // (FIFO position = rest-state proxy). Even if including them would
+    // produce a slightly better-balanced lineup, the look-ahead must
+    // honor the partition's longest-waiter-first ordering and pick the
+    // 4 longest-waiting players for this court's must-include set.
     //
-    // Setup: 5 waiters in queue order. w5 is the recent winner (at the
-    // back). 1 court → only the first 4 are partitioned in.
-    const pool = ['w1', 'w2', 'w3', 'w4', 'w5_recent_winner'];
-    const partition = partitionWaitersAcrossCourts(pool, ['courtA']);
+    // Setup: 5 waiters. w5_recent_winner has the IDEAL skill (90) for
+    // perfect balance with the other 3 (95, 85, 90, 90). w1..w4 are
+    // slightly off-balance. A naive picker would prefer w5 to minimise
+    // gap, but the partitioner must still drop w5 because they're
+    // newest in queue.
+    const allPlayers = [
+      mkPlayer('w1', 'W1', 95),
+      mkPlayer('w2', 'W2', 85),
+      mkPlayer('w3', 'W3', 92),
+      mkPlayer('w4', 'W4', 88),
+      mkPlayer('w5_recent_winner', 'W5', 90),
+    ];
+    const pool = allPlayers.map(p => p.id);
 
-    expect(partition.get('courtA')).toEqual(['w1', 'w2', 'w3', 'w4']);
-    expect(partition.get('courtA')).not.toContain('w5_recent_winner');
+    const partition = partitionWaitersAcrossCourts(pool, ['courtA']);
+    const must = partition.get('courtA')!;
+
+    // Longest-waiters win regardless of balance impact.
+    expect(must).toEqual(['w1', 'w2', 'w3', 'w4']);
+    expect(must).not.toContain('w5_recent_winner');
+
+    // And the look-ahead, given that partition, also excludes w5 from
+    // the final lineup — the recent winner gets to rest this round.
+    const result = pickLineupWithLookahead(
+      'session-s4',
+      must,
+      [],
+      [], // no active borrow candidates here — this isolates the rest-state assertion to partition behavior
+      allPlayers,
+    );
+    expect(result).not.toBeNull();
+    const lineup = new Set([...result!.lineup.team1Ids, ...result!.lineup.team2Ids]);
+    expect(lineup.has('w5_recent_winner')).toBe(false);
+    expect(lineup.has('w1')).toBe(true);
+    expect(lineup.has('w2')).toBe(true);
+    expect(lineup.has('w3')).toBe(true);
+    expect(lineup.has('w4')).toBe(true);
   });
 
   // ── Scenario 5 ────────────────────────────────────────────────────────
@@ -231,6 +262,31 @@ describe('Task #65 — Balanced queued look-ahead', () => {
         allPlayers,
       ),
     ).toBe(40);
+  });
+
+  it('validateClaudeMustIncludes rejects a lineup that drops a partitioned waiter', () => {
+    // Simulates the exact failure mode flagged in code review:
+    // tryClaudeQueuedBatch passed must=[w1,w2] for court A, but Claude
+    // returned a lineup of [a1,a2,a3,a4] (all borrowed actives, both
+    // waiters dropped). The validator must reject.
+    const mustIds = ['w1', 'w2'];
+    const droppedLineup = new Set(['a1', 'a2', 'a3', 'a4']);
+    expect(validateClaudeMustIncludes(mustIds, droppedLineup)).toBe(false);
+
+    // Partial drop also rejected (only w1 made it).
+    const partialLineup = new Set(['w1', 'a1', 'a2', 'a3']);
+    expect(validateClaudeMustIncludes(mustIds, partialLineup)).toBe(false);
+
+    // Compliant lineup accepted (both must-includes present).
+    const goodLineup = new Set(['w1', 'w2', 'a1', 'a2']);
+    expect(validateClaudeMustIncludes(mustIds, goodLineup)).toBe(true);
+
+    // Empty mustIds (no waiters partitioned to this court) → vacuously
+    // true; the orchestrator's outer guard already skips that court.
+    expect(validateClaudeMustIncludes([], goodLineup)).toBe(true);
+
+    // Accepts arrays as well as Sets.
+    expect(validateClaudeMustIncludes(mustIds, ['w1', 'w2', 'a1', 'a2'])).toBe(true);
   });
 
   it('partitionWaitersAcrossCourts caps each court at 4 mustIncludes', () => {

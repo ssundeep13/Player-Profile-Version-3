@@ -427,6 +427,23 @@ export function computeLineupSkillGap(
 }
 
 /**
+ * Validate that every must-include waiter is present in the lineup.
+ * Used by tryClaudeQueuedBatch to reject any Claude response that
+ * silently dropped a partitioned waiter in favour of a borrowed active
+ * player. Pure function — exported for tests.
+ */
+export function validateClaudeMustIncludes(
+  mustIds: string[],
+  lineupIds: Set<string> | string[],
+): boolean {
+  const lineup = lineupIds instanceof Set ? lineupIds : new Set(lineupIds);
+  for (const id of mustIds) {
+    if (!lineup.has(id)) return false;
+  }
+  return true;
+}
+
+/**
  * Round-robin partition the waiting `pool` (queue order, longest-waited
  * first) across the given courts so each waiter is assigned to exactly
  * one court. Each court is capped at 4 mustInclude players; any waiters
@@ -936,6 +953,22 @@ async function tryClaudeQueuedBatch(
     if (!t1 || !t2 || t1.length !== 2 || t2.length !== 2) continue;
     const all4 = new Set([...t1, ...t2]);
     if (all4.size !== 4) continue;
+
+    // Must-include enforcement (Task #65 invariant): every waiter
+    // partitioned to this court MUST appear in the final lineup.
+    // Without this check, Claude could silently borrow active players
+    // and drop a partitioned waiter — that waiter would then go
+    // unassigned for the round (this court is already counted as
+    // "filled" so the per-court look-ahead pass skips it). Reject the
+    // row instead so the look-ahead fallback can re-build it correctly.
+    const mustIds = claudePartition.get(court.id) ?? [];
+    if (!validateClaudeMustIncludes(mustIds, all4)) {
+      console.log(
+        `[queued-orchestrator] session=${sessionId} court=${court.id} ` +
+        `Claude row rejected — missing must-include waiter(s); falling back to look-ahead`,
+      );
+      continue;
+    }
 
     // includesActivePlayers = true when the lineup pulls in any player who
     // wasn't in the waiting pool at orchestrator-time. The game-end
