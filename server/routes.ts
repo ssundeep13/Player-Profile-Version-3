@@ -1835,6 +1835,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Persist the reduced queue once after all courts assigned
       await storage.setQueue(gameSession.id, currentQueue);
 
+      // Fire the matchmaker so the queued ("Up next") orchestrator can
+      // build next-round lineups for the courts we just put into play.
+      // Without this hook the admin's bracket-assign would leave every
+      // freshly-occupied court without an "Up next" lineup until a
+      // game ends, and waiting players (e.g. Male Test 3 in the
+      // task #65 repro) only see the read-only projection card. Async
+      // fire-and-forget so a slow Claude/DB call can't slow the
+      // admin's UI response. See task #65 for the bug history.
+      setImmediate(() => {
+        import('./auto-matchmaking').then(m =>
+          m.tryAutoMatchmaking(gameSession.id).catch(err =>
+            console.error('[auto-matchmaking] post-bracket-assign unhandled:', err),
+          ),
+        );
+      });
+
       res.json({ success: true, courts: results });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -1972,6 +1988,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return { ...player, team: cp.team };
         })
       )).filter(p => p !== null);
+
+      // Fire the matchmaker so the queued ("Up next") orchestrator can
+      // build a next-round lineup for the court we just put into play
+      // (and for any other already-in-play court that's still missing
+      // one). Without this, an admin-driven Start Game leaves the
+      // court bare on the player phones — see task #65 for the bug
+      // history. Async fire-and-forget; the admin response shouldn't
+      // wait on a DB/Claude pass.
+      setImmediate(() => {
+        import('./auto-matchmaking').then(m =>
+          m.tryAutoMatchmaking(gameSession.id).catch(err =>
+            console.error('[auto-matchmaking] post-court-assign unhandled:', err),
+          ),
+        );
+      });
 
       res.json({ ...updatedCourt, players });
     } catch (error) {
