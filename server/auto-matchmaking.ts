@@ -543,16 +543,25 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
 }
 
 // ─── Queued (next-round) orchestrator ───────────────────────────────────────
-// Builds 'queued' suggestions for any 'playing' court that doesn't already
+// Builds 'queued' suggestions for any in-play court that doesn't already
 // have one. Uses the standard bracket generator for a single court, and the
 // player-flow Claude prompt (batched, single API call) when 2+ courts need
 // queued at the same time.
+//
+// "In-play" includes BOTH 'occupied' (legacy admin assign + the canonical
+// player-driven start path in storage.startApprovedSuggestion) AND
+// 'playing' (defensive — no current write site sets it, but if a future
+// path does we still want to build a queued lineup for it). Filtering on
+// 'playing' alone is dead code per shared/schema.ts:147 — see the
+// task-64 plan for the bug history.
 async function runQueuedOrchestrator(
   sessionId: string,
   allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
 ): Promise<void> {
   const allCourts = await storage.getCourtsBySession(sessionId);
-  const playingCourts = allCourts.filter(c => c.status === 'playing');
+  const playingCourts = allCourts.filter(
+    c => c.status === 'occupied' || c.status === 'playing',
+  );
   if (playingCourts.length === 0) return;
 
   const courtsWithQueued = await getCourtsWithQueuedSuggestions(sessionId);

@@ -475,8 +475,6 @@ function WaitingScreen({ onDone }: { onDone: () => void }) {
 
       <WaitingChips stats={stats} />
 
-      <EtaHint stats={stats} />
-
       <CourtsInPlayStrip courts={stats?.courtsInPlay ?? []} />
 
       {!suggestion || suggestion.status === 'dismissed' ? (
@@ -573,38 +571,6 @@ function WaitingChips({ stats }: { stats: TodayStatsResponse | undefined }) {
         );
       })}
     </div>
-  );
-}
-
-function EtaHint({ stats }: { stats: TodayStatsResponse | undefined }) {
-  // Coarse ETA: assumes ~12 minutes per game per court. With no queue
-  // position or no busy courts, we can't say anything useful — render
-  // nothing rather than guess. Renders a fixed-height row regardless
-  // of state so the page doesn't shift when the ETA appears/disappears.
-  const minutes = useMemo(() => {
-    if (!stats || stats.queuePosition == null) return null;
-    const courts = stats.courtsInPlay?.length ?? 0;
-    if (courts <= 0) return null;
-    // Queue position is player-based; each game consumes 4 players.
-    // 1) playersAhead → gamesAhead (groups of 4)
-    // 2) gamesAhead distributed over parallel courts → waves to wait
-    // 3) each wave ≈ 12 minutes
-    const playersAhead = Math.max(0, stats.queuePosition - 1);
-    const gamesAhead = Math.ceil(playersAhead / 4);
-    const waves = Math.ceil(gamesAhead / Math.max(courts, 1));
-    return Math.max(0, waves * 12);
-  }, [stats]);
-  return (
-    <p
-      className="text-xs text-center text-muted-foreground h-4"
-      data-testid="text-eta-hint"
-    >
-      {minutes == null
-        ? ''
-        : minutes <= 0
-          ? 'You should be up next.'
-          : `Roughly ${minutes} min until your next game.`}
-    </p>
   );
 }
 
