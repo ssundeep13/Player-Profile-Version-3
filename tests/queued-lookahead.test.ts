@@ -14,7 +14,28 @@
 //   5. Regression: a balanced 4-waiting pool on 1 court still produces a
 //      pure-waiting queued row (includesActivePlayers=false).
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// auto-matchmaking imports server/db at module load; stub it so local
+// vitest runs don't require DATABASE_URL (same pattern as
+// queued-orchestrator-incremental-checkins.test.ts).
+vi.mock('../server/db', () => {
+  return {
+    db: {
+      select: () => {
+        const chain = {
+          from: (_table: unknown) => chain,
+          innerJoin: (_table: unknown, _cond: unknown) => chain,
+          where: (_cond: unknown) => [] as unknown[],
+        };
+        return chain;
+      },
+      transaction: async (fn: (tx: { execute: () => Promise<{ rows: unknown[] }> }) => unknown) =>
+        fn({ execute: async () => ({ rows: [{ locked: true }] }) }),
+    },
+  };
+});
+
 import {
   pickLineupWithLookahead,
   partitionWaitersAcrossCourts,
