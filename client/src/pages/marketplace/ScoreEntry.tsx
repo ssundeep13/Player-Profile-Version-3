@@ -74,10 +74,14 @@ export default function ScoreEntry() {
       return res.json();
     },
     refetchInterval: false,
+    refetchOnWindowFocus: false,
     staleTime: 0,
   });
 
   const suggestion = suggestionQuery.data?.suggestion ?? null;
+  // Pin the lineup shown in the form so a background refetch cannot swap
+  // in the next-round pending suggestion (empty 0-0 form for wrong match).
+  const latchedSuggestionRef = useRef<CurrentSuggestion | null>(null);
 
   // Latch the initial decision (form vs. already-submitted view) the FIRST
   // time the query resolves and never recompute it from later refetches.
@@ -95,6 +99,9 @@ export default function ScoreEntry() {
     const status = suggestion?.status ?? null;
     if (status === 'playing') {
       initialBranchRef.current = 'form';
+      if (suggestion) {
+        latchedSuggestionRef.current = suggestion;
+      }
     } else if (status === 'completed') {
       initialBranchRef.current = 'already-submitted';
     } else {
@@ -118,8 +125,8 @@ export default function ScoreEntry() {
     >
       {initialBranch === null ? (
         <InitialSkeleton />
-      ) : initialBranch === 'form' && suggestion ? (
-        <ScoreEntryContent suggestion={suggestion} />
+      ) : initialBranch === 'form' && latchedSuggestionRef.current ? (
+        <ScoreEntryContent suggestion={latchedSuggestionRef.current} />
       ) : initialBranch === 'already-submitted' ? (
         // Late-submitter path: by the time this player landed on the score
         // screen, another player on the court had already submitted the
