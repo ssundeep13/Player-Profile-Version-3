@@ -1456,6 +1456,101 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  const lineupSwapBodySchema = z.object({
+    swaps: z.array(z.object({
+      removePlayerId: z.string().min(1),
+      addPlayerId: z.string().min(1),
+      team: z.union([z.literal(1), z.literal(2)]),
+    })).min(1),
+  });
+
+  // Waiting players eligible to replace someone in a pending/queued lineup.
+  app.get(
+    "/api/sessions/:sessionId/suggestions/:suggestionId/swap-candidates",
+    requireAuth,
+    requireAdmin,
+    async (req: AuthRequest, res) => {
+      try {
+        const { sessionId, suggestionId } = req.params;
+        const session = await storage.getSession(sessionId);
+        if (!session) return res.status(404).json({ error: "Session not found" });
+        const data = await storage.getLineupSwapCandidates(sessionId, suggestionId);
+        res.json(data);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load swap candidates';
+        if (message.includes('not found') || message.includes('not editable')) {
+          return res.status(404).json({ error: message });
+        }
+        console.error('Swap candidates error:', error);
+        res.status(500).json({ error: "Failed to load swap candidates" });
+      }
+    },
+  );
+
+  // Court Captain: replace players in a pending or queued lineup.
+  app.put(
+    "/api/sessions/:sessionId/suggestions/:suggestionId/players",
+    requireAuth,
+    requireAdmin,
+    async (req: AuthRequest, res) => {
+      try {
+        const { sessionId, suggestionId } = req.params;
+        const parsed = lineupSwapBodySchema.safeParse(req.body);
+        if (!parsed.success) {
+          return res.status(400).json({ error: "Invalid request body", details: parsed.error.flatten() });
+        }
+
+        const session = await storage.getSession(sessionId);
+        if (!session) return res.status(404).json({ error: "Session not found" });
+
+        const updated = await storage.swapMatchSuggestionPlayers(
+          sessionId,
+          suggestionId,
+          parsed.data.swaps,
+        );
+
+        const affectedIds = new Set<string>();
+        for (const swap of parsed.data.swaps) {
+          affectedIds.add(swap.removePlayerId);
+          affectedIds.add(swap.addPlayerId);
+        }
+        const mUsers = await storage.getMarketplaceUsersByLinkedPlayerIds([...affectedIds]);
+        const notifyMessage = 'Your lineup has been updated — check the Play screen';
+        for (const mUser of mUsers) {
+          if (!mUser.linkedPlayerId || !affectedIds.has(mUser.linkedPlayerId)) continue;
+          await storage.createMarketplaceNotification({
+            userId: mUser.id,
+            type: 'lineup_updated',
+            title: 'Lineup updated',
+            message: notifyMessage,
+          }).catch(err => console.error('[Court Captain] lineup swap notify failed:', err));
+        }
+
+        console.log(
+          `[Court Captain] suggestion ${suggestionId} lineup edited by ${req.user?.userId ?? 'admin'} ` +
+          `(${parsed.data.swaps.length} swap(s))`,
+        );
+        res.json({ suggestion: updated });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to update lineup';
+        if (
+          message.includes('not found') ||
+          message.includes('not editable') ||
+          message.includes('not in') ||
+          message.includes('Cannot swap') ||
+          message.includes('already') ||
+          message.includes('does not exist') ||
+          message.includes('sitting out') ||
+          message.includes('must contain')
+        ) {
+          return res.status(400).json({ error: message });
+        }
+        console.error('Lineup swap error:', error);
+        res.status(500).json({ error: "Failed to update lineup" });
+      }
+    },
+  );
+
   app.get("/api/sessions/:sessionId/queue/sitting-out", requireAuth, requireAdmin, async (req: AuthRequest, res) => {
     try {
       const { sessionId } = req.params;

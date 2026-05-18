@@ -89,7 +89,7 @@ import {
 import { db } from "./db";
 import { eq, and, inArray, desc, sql, asc, like, gte, lt, isNotNull, isNull, SQL } from "drizzle-orm";
 import { randomUUID } from "crypto";
-import { clearSessionRestStates } from "./matchmaking";
+import { clearSessionRestStates, getSittingOutPlayers } from "./matchmaking";
 
 // Helper function to add computed SKID to player object
 function addSkidToPlayer(player: typeof players.$inferSelect): Player {
@@ -385,6 +385,18 @@ export interface IStorage {
     courtName: string;
     players: Array<MatchSuggestionPlayer & { name: string }>;
   }>>;
+  getLineupSwapCandidates(sessionId: string, suggestionId: string): Promise<{
+    candidates: Array<{ playerId: string; name: string }>;
+    playingPlayerIds: string[];
+  }>;
+  swapMatchSuggestionPlayers(
+    sessionId: string,
+    suggestionId: string,
+    swaps: Array<{ removePlayerId: string; addPlayerId: string; team: number }>,
+  ): Promise<(MatchSuggestion & {
+    courtName: string;
+    players: Array<MatchSuggestionPlayer & { name: string }>;
+  })>;
 
   // Player personality tag operations
   getAllTags(): Promise<Tag[]>;
@@ -2532,6 +2544,213 @@ export class DatabaseStorage implements IStorage {
       byParent.set(row.suggestionId, list);
     }
     return parents.map(p => ({ ...p, players: byParent.get(p.id) ?? [] }));
+  }
+
+  async getLineupSwapCandidates(sessionId: string, suggestionId: string): Promise<{
+    candidates: Array<{ playerId: string; name: string }>;
+    playingPlayerIds: string[];
+  }> {
+    const suggestion = await this.getMatchSuggestion(suggestionId);
+    if (!suggestion || suggestion.sessionId !== sessionId) {
+      throw new Error('Suggestion not found');
+    }
+    if (suggestion.status !== 'pending' && suggestion.status !== 'queued') {
+      throw new Error(`Suggestion status ${suggestion.status} is not editable`);
+    }
+
+    const lineupIds = new Set(suggestion.players.map(p => p.playerId));
+    const queue = await this.getQueue(sessionId);
+    const sittingOut = new Set(getSittingOutPlayers(sessionId));
+
+    const onOtherOpenRows = await db
+      .select({ playerId: matchSuggestionPlayers.playerId })
+      .from(matchSuggestionPlayers)
+      .innerJoin(matchSuggestions, eq(matchSuggestionPlayers.suggestionId, matchSuggestions.id))
+      .where(and(
+        eq(matchSuggestions.sessionId, sessionId),
+        inArray(matchSuggestions.status, ['pending', 'approved', 'playing', 'queued']),
+        sql`${matchSuggestions.id} <> ${suggestionId}`,
+      ));
+    const onOtherOpen = new Set(onOtherOpenRows.map(r => r.playerId));
+
+    const onCourtPlayingRows = await db
+      .select({ playerId: matchSuggestionPlayers.playerId })
+      .from(matchSuggestionPlayers)
+      .innerJoin(matchSuggestions, eq(matchSuggestionPlayers.suggestionId, matchSuggestions.id))
+      .where(and(
+        eq(matchSuggestions.sessionId, sessionId),
+        eq(matchSuggestions.status, 'playing'),
+      ));
+    const playingPlayerIds = new Set(onCourtPlayingRows.map(r => r.playerId));
+
+    const sessionCourts = await this.getCourtsBySession(sessionId);
+    for (const court of sessionCourts) {
+      if (court.status === 'occupied' || court.status === 'playing') {
+        const courtPlayerIds = await this.getCourtPlayers(court.id);
+        for (const id of courtPlayerIds) playingPlayerIds.add(id);
+      }
+    }
+
+    const eligibleQueueIds = queue.filter(id =>
+      !sittingOut.has(id) &&
+      !onOtherOpen.has(id) &&
+      !lineupIds.has(id) &&
+      !playingPlayerIds.has(id),
+    );
+
+    const candidatePlayers = eligibleQueueIds.length > 0
+      ? await this.getPlayersByIds(eligibleQueueIds)
+      : [];
+    const nameById = new Map(candidatePlayers.map(p => [p.id, p.name]));
+    const candidates = eligibleQueueIds
+      .map(id => ({ playerId: id, name: nameById.get(id) ?? id }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return {
+      candidates,
+      playingPlayerIds: [...playingPlayerIds],
+    };
+  }
+
+  async swapMatchSuggestionPlayers(
+    sessionId: string,
+    suggestionId: string,
+    swaps: Array<{ removePlayerId: string; addPlayerId: string; team: number }>,
+  ): Promise<(MatchSuggestion & {
+    courtName: string;
+    players: Array<MatchSuggestionPlayer & { name: string }>;
+  })> {
+    if (swaps.length === 0) {
+      throw new Error('At least one swap is required');
+    }
+
+    const suggestion = await this.getMatchSuggestion(suggestionId);
+    if (!suggestion || suggestion.sessionId !== sessionId) {
+      throw new Error('Suggestion not found');
+    }
+    if (suggestion.status !== 'pending' && suggestion.status !== 'queued') {
+      throw new Error(`Suggestion status ${suggestion.status} is not editable`);
+    }
+
+    const lineupByPlayer = new Map(suggestion.players.map(p => [p.playerId, p]));
+    const removeIds = new Set<string>();
+    const addIds = new Set<string>();
+    for (const swap of swaps) {
+      if (swap.team !== 1 && swap.team !== 2) {
+        throw new Error('team must be 1 or 2');
+      }
+      const existing = lineupByPlayer.get(swap.removePlayerId);
+      if (!existing) {
+        throw new Error(`Player ${swap.removePlayerId} is not in this lineup`);
+      }
+      if (existing.team !== swap.team) {
+        throw new Error(`Player ${swap.removePlayerId} is not on team ${swap.team}`);
+      }
+      if (removeIds.has(swap.removePlayerId)) {
+        throw new Error(`Duplicate removePlayerId ${swap.removePlayerId}`);
+      }
+      if (addIds.has(swap.addPlayerId)) {
+        throw new Error(`Duplicate addPlayerId ${swap.addPlayerId}`);
+      }
+      removeIds.add(swap.removePlayerId);
+      addIds.add(swap.addPlayerId);
+    }
+
+    for (const addId of addIds) {
+      const player = await this.getPlayer(addId);
+      if (!player) {
+        throw new Error(`Player ${addId} does not exist`);
+      }
+    }
+
+    const queue = await this.getQueue(sessionId);
+    const queueSet = new Set(queue);
+    for (const addId of addIds) {
+      if (!queueSet.has(addId)) {
+        throw new Error(`Player ${addId} is not in the session queue`);
+      }
+    }
+
+    const sittingOut = new Set(getSittingOutPlayers(sessionId));
+    for (const addId of addIds) {
+      if (sittingOut.has(addId)) {
+        throw new Error(`Player ${addId} is sitting out`);
+      }
+    }
+
+    const onOtherOpenRows = await db
+      .select({ playerId: matchSuggestionPlayers.playerId })
+      .from(matchSuggestionPlayers)
+      .innerJoin(matchSuggestions, eq(matchSuggestionPlayers.suggestionId, matchSuggestions.id))
+      .where(and(
+        eq(matchSuggestions.sessionId, sessionId),
+        inArray(matchSuggestions.status, ['pending', 'approved', 'playing', 'queued']),
+        sql`${matchSuggestions.id} <> ${suggestionId}`,
+        inArray(matchSuggestionPlayers.playerId, [...addIds]),
+      ));
+    if (onOtherOpenRows.length > 0) {
+      throw new Error('Replacement player is already assigned to another active suggestion');
+    }
+
+    const onCourtPlayingRows = await db
+      .select({ playerId: matchSuggestionPlayers.playerId })
+      .from(matchSuggestionPlayers)
+      .innerJoin(matchSuggestions, eq(matchSuggestionPlayers.suggestionId, matchSuggestions.id))
+      .where(and(
+        eq(matchSuggestions.sessionId, sessionId),
+        eq(matchSuggestions.status, 'playing'),
+        inArray(matchSuggestionPlayers.playerId, [...removeIds]),
+      ));
+    if (onCourtPlayingRows.length > 0) {
+      throw new Error('Cannot swap a player who is currently on court playing');
+    }
+
+    const sessionCourts = await this.getCourtsBySession(sessionId);
+    for (const court of sessionCourts) {
+      if (court.status !== 'occupied' && court.status !== 'playing') continue;
+      const courtPlayerIds = await this.getCourtPlayers(court.id);
+      for (const removeId of removeIds) {
+        if (courtPlayerIds.includes(removeId)) {
+          throw new Error('Cannot swap a player who is currently on court playing');
+        }
+      }
+    }
+
+    const finalIds = new Set(suggestion.players.map(p => p.playerId));
+    for (const swap of swaps) {
+      if (finalIds.has(swap.addPlayerId)) {
+        throw new Error(`Player ${swap.addPlayerId} is already in this lineup`);
+      }
+      finalIds.delete(swap.removePlayerId);
+      finalIds.add(swap.addPlayerId);
+    }
+    if (finalIds.size !== 4) {
+      throw new Error('Lineup must contain exactly 4 players after swaps');
+    }
+
+    await db.transaction(async (tx) => {
+      for (const swap of swaps) {
+        await tx
+          .delete(matchSuggestionPlayers)
+          .where(and(
+            eq(matchSuggestionPlayers.suggestionId, suggestionId),
+            eq(matchSuggestionPlayers.playerId, swap.removePlayerId),
+          ));
+        await tx.insert(matchSuggestionPlayers).values({
+          suggestionId,
+          courtId: suggestion.courtId,
+          playerId: swap.addPlayerId,
+          team: swap.team,
+        });
+      }
+    });
+
+    const all = await this.listSessionPendingSuggestionsWithDetails(sessionId);
+    const updated = all.find(s => s.id === suggestionId);
+    if (!updated) {
+      throw new Error('Updated suggestion not found');
+    }
+    return updated;
   }
 
   // ── Player Personality Tags ────────────────────────────────────────────────
