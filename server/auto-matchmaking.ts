@@ -743,13 +743,22 @@ export function isCourtInPlay(court: { status: string }): boolean {
  * returned to the rebuild pool.
  *
  * `courtsWithPureQueued` — courts that already have a pure-waiting
- * queued lineup. These are already optimal and the orchestrator skips
- * them (no churn on score-submit-triggered runs).
+ * queued lineup. Skipped only when EVERY in-play court already has a
+ * queued row; otherwise rebuilt so waiters are not stranded on one
+ * court when a second court comes in-play.
+ *
+ * `pureQueuedSuggestionByCourtId` / `pureQueuedPlayerIds` — used to
+ * return pure-queued waiters to the rebuild pool and dismiss stale
+ * rows after a successful replacement (same replace-in-place pattern
+ * as borrowed rows).
  */
 interface QueuedRowSnapshot {
   borrowedSuggestionByCourtId: Map<string, string>;
   courtsWithPureQueued: Set<string>;
   borrowedPlayerIds: Set<string>;
+  pureQueuedSuggestionByCourtId: Map<string, string>;
+  pureQueuedPlayerIds: Set<string>;
+  purePlayerIdsBySuggestionId: Map<string, Set<string>>;
 }
 
 /**
@@ -770,6 +779,7 @@ export async function snapshotQueuedRows(sessionId: string): Promise<QueuedRowSn
     ));
 
   const borrowedSuggestionByCourtId = new Map<string, string>();
+  const pureQueuedSuggestionByCourtId = new Map<string, string>();
   const courtsWithPureQueued = new Set<string>();
   for (const r of existingRows) {
     if (r.includesActivePlayers) {
@@ -779,20 +789,48 @@ export async function snapshotQueuedRows(sessionId: string): Promise<QueuedRowSn
       borrowedSuggestionByCourtId.set(r.courtId, r.id);
     } else {
       courtsWithPureQueued.add(r.courtId);
+      pureQueuedSuggestionByCourtId.set(r.courtId, r.id);
     }
   }
 
   const borrowedPlayerIds = new Set<string>();
-  if (borrowedSuggestionByCourtId.size > 0) {
-    const borrowedIds = Array.from(borrowedSuggestionByCourtId.values());
+  const pureQueuedPlayerIds = new Set<string>();
+  const purePlayerIdsBySuggestionId = new Map<string, Set<string>>();
+  const borrowedIdSet = new Set(borrowedSuggestionByCourtId.values());
+  const pureIdSet = new Set(pureQueuedSuggestionByCourtId.values());
+  const allQueuedSuggestionIds = [...borrowedIdSet, ...pureIdSet];
+  if (allQueuedSuggestionIds.length > 0) {
     const playerRows = await db
-      .select({ playerId: matchSuggestionPlayers.playerId })
+      .select({
+        suggestionId: matchSuggestionPlayers.suggestionId,
+        playerId: matchSuggestionPlayers.playerId,
+      })
       .from(matchSuggestionPlayers)
-      .where(inArray(matchSuggestionPlayers.suggestionId, borrowedIds));
-    for (const r of playerRows) borrowedPlayerIds.add(r.playerId);
+      .where(inArray(matchSuggestionPlayers.suggestionId, allQueuedSuggestionIds));
+    for (const r of playerRows) {
+      if (borrowedIdSet.has(r.suggestionId)) {
+        borrowedPlayerIds.add(r.playerId);
+      }
+      if (pureIdSet.has(r.suggestionId)) {
+        pureQueuedPlayerIds.add(r.playerId);
+        let ids = purePlayerIdsBySuggestionId.get(r.suggestionId);
+        if (!ids) {
+          ids = new Set<string>();
+          purePlayerIdsBySuggestionId.set(r.suggestionId, ids);
+        }
+        ids.add(r.playerId);
+      }
+    }
   }
 
-  return { borrowedSuggestionByCourtId, courtsWithPureQueued, borrowedPlayerIds };
+  return {
+    borrowedSuggestionByCourtId,
+    courtsWithPureQueued,
+    borrowedPlayerIds,
+    pureQueuedSuggestionByCourtId,
+    pureQueuedPlayerIds,
+    purePlayerIdsBySuggestionId,
+  };
 }
 
 export async function runQueuedOrchestrator(
@@ -817,22 +855,53 @@ export async function runQueuedOrchestrator(
   // the rebuild for a given court returns null or throws, that
   // court's prior borrowed row stays in place — players keep seeing
   // their existing OnDeckCard rather than regressing to
-  // ProjectionCard. Pure-waiting queued rows are skipped entirely
-  // (already optimal — no churn on score-submit-triggered runs).
+  // ProjectionCard. Pure-waiting rows are only left untouched when
+  // every in-play court already has a queued lineup; otherwise a
+  // pure row that hoarded all waiters is rebuilt and re-partitioned.
   const snapshot = await snapshotQueuedRows(sessionId);
-  const { borrowedSuggestionByCourtId, courtsWithPureQueued, borrowedPlayerIds } = snapshot;
+  const {
+    borrowedSuggestionByCourtId,
+    courtsWithPureQueued,
+    borrowedPlayerIds,
+    pureQueuedSuggestionByCourtId,
+    purePlayerIdsBySuggestionId,
+  } = snapshot;
 
-  const courtsNeedingQueued = playingCourts.filter(c => !courtsWithPureQueued.has(c.id));
+  const queuedCourtIds = new Set<string>([
+    ...borrowedSuggestionByCourtId.keys(),
+    ...pureQueuedSuggestionByCourtId.keys(),
+  ]);
+  const allInPlayCourtsHaveQueued = playingCourts.every(c => queuedCourtIds.has(c.id));
+
+  const courtsNeedingQueued = playingCourts.filter(c => {
+    if (!queuedCourtIds.has(c.id)) return true;
+    // Borrowed rows are always eligible for replace-in-place (task #69).
+    if (borrowedSuggestionByCourtId.has(c.id)) return true;
+    // Pure-waiting row: skip only when every occupied court already
+    // has a queued lineup (no churn on routine score-submit runs).
+    if (courtsWithPureQueued.has(c.id) && allInPlayCourtsHaveQueued) return false;
+    if (courtsWithPureQueued.has(c.id)) return true;
+    return false;
+  });
   if (courtsNeedingQueued.length === 0) return;
 
   // Pool: queue minus sitting-out minus players locked into ANY open
-  // suggestion EXCEPT borrowed-queued rows we intend to replace this
-  // run. Borrowed-queued players are returned to the pool so the
-  // rebuild can re-use them in a more-balanced lineup.
+  // suggestion EXCEPT queued rows we intend to replace this run.
+  // Borrowed- and stranded-pure-queued players are returned to the
+  // rebuild pool so the orchestrator can re-partition them across
+  // every court that still needs a lineup.
   const onAnyOpen = await getPlayersOnAnyOpenSuggestion(sessionId);
+  const rebuildPoolPlayerIds = new Set<string>(borrowedPlayerIds);
+  for (const court of courtsNeedingQueued) {
+    const pureSugId = pureQueuedSuggestionByCourtId.get(court.id);
+    if (pureSugId) {
+      const ids = purePlayerIdsBySuggestionId.get(pureSugId);
+      if (ids) ids.forEach(id => rebuildPoolPlayerIds.add(id));
+    }
+  }
   const lockedIds = new Set<string>();
   for (const id of onAnyOpen) {
-    if (!borrowedPlayerIds.has(id)) lockedIds.add(id);
+    if (!rebuildPoolPlayerIds.has(id)) lockedIds.add(id);
   }
   const sittingOut = new Set(getSittingOutPlayers(sessionId));
   const queue = await storage.getQueue(sessionId);
@@ -882,6 +951,16 @@ export async function runQueuedOrchestrator(
           console.log(
             `[queued-orchestrator] session=${sessionId} court=${courtId} ` +
             `replaced borrowed queued row ${oldBorrowedId} (Claude pass)`,
+          );
+        }
+      }
+      const oldPureId = pureQueuedSuggestionByCourtId.get(courtId);
+      if (oldPureId) {
+        const dismissed = await storage.dismissQueuedSuggestion(oldPureId);
+        if (dismissed) {
+          console.log(
+            `[queued-orchestrator] session=${sessionId} court=${courtId} ` +
+            `replaced pure queued row ${oldPureId} (Claude pass)`,
           );
         }
       }
@@ -966,6 +1045,16 @@ export async function runQueuedOrchestrator(
           console.log(
             `[queued-orchestrator] session=${sessionId} court=${court.id} ` +
             `replaced borrowed queued row ${oldBorrowedId} (look-ahead pass)`,
+          );
+        }
+      }
+      const oldPureId = pureQueuedSuggestionByCourtId.get(court.id);
+      if (oldPureId) {
+        const dismissed = await storage.dismissQueuedSuggestion(oldPureId);
+        if (dismissed) {
+          console.log(
+            `[queued-orchestrator] session=${sessionId} court=${court.id} ` +
+            `replaced pure queued row ${oldPureId} (look-ahead pass)`,
           );
         }
       }

@@ -110,13 +110,13 @@ vi.mock('../server/db', () => {
                   .filter(s => open.has(s.status))
                   .flatMap(s => s.players.map(p => ({ playerId: p.playerId })));
               }
-              // snapshotQueuedRows step 2: borrowed-queued players only.
-              // The orchestrator passes inArray(suggestionId, borrowedIds);
-              // since the dispatcher can't introspect the WHERE, return
-              // every player from every borrowed-queued row.
+              // snapshotQueuedRows step 2: players on any queued row.
               return mockState.suggestions
-                .filter(s => s.status === 'queued' && s.includesActivePlayers)
-                .flatMap(s => s.players.map(p => ({ playerId: p.playerId })));
+                .filter(s => s.status === 'queued')
+                .flatMap(s => s.players.map(p => ({
+                  suggestionId: s.id,
+                  playerId: p.playerId,
+                })));
             }
             return [];
           },
@@ -349,6 +349,43 @@ describe('Task #69 — incremental check-ins absorb all waiters', () => {
         },
       );
     }
+
+    it('rebuilds stranded pure queued when the other occupied court has no lineup', async () => {
+      // Live-test bug: only court B was in-play when the 4 waiters
+      // checked in, so a pure-waiting queued row hoarded all 4 on
+      // court B. When court A became occupied, court B was skipped
+      // (courtsWithPureQueued) and the waiters stayed locked on B's
+      // queued row — pool=0, court A got nothing.
+      seedTwoOccupiedCourts();
+      mockState.suggestions.push({
+        id: 'sug-pure-B',
+        sessionId: 's-test',
+        courtId: 'courtB',
+        status: 'queued',
+        includesActivePlayers: false,
+        players: [
+          { playerId: 'f1', team: 1 },
+          { playerId: 'f2', team: 1 },
+          { playerId: 'f3', team: 2 },
+          { playerId: 'f4', team: 2 },
+        ],
+      });
+
+      await runQueuedOrchestrator('s-test', mkAllPlayers());
+
+      expect(mockDismissCalls).toContain('sug-pure-B');
+      const queuedCreates = mockCreateCalls.filter(c => c.status === 'queued');
+      expect(queuedCreates).toHaveLength(2);
+      expect(new Set(queuedCreates.map(c => c.courtId))).toEqual(
+        new Set(['courtA', 'courtB']),
+      );
+      const allCreatedPlayerIds = new Set(
+        queuedCreates.flatMap(c => c.players.map(p => p.playerId)),
+      );
+      for (const fid of ['f1', 'f2', 'f3', 'f4']) {
+        expect(allCreatedPlayerIds.has(fid)).toBe(true);
+      }
+    });
 
     it('replaces both stale borrowed rows; new queued rows name all 4 waiters', async () => {
       seedTwoOccupiedCourts();
