@@ -32,6 +32,9 @@ import {
   findBalancedTeams,
   buildRestStatesFromHistory,
   buildPartnerHistoryFromHistory,
+  buildFourPlayerHistoryFromHistory,
+  hasPlayedFourPlayerSet,
+  isSameFourPlayerSet,
   loadRestStatesFromDb,
   getPlayerRestState,
   getSittingOutPlayers,
@@ -324,7 +327,9 @@ export function pickLineupWithMustInclude(
   mustIncludeIds: string[],
   fillFromIds: string[],
   allPlayers: Awaited<ReturnType<typeof storage.getAllPlayers>>,
+  options: { rejectActiveRosterIds?: string[] } = {},
 ): Lineup | null {
+  const rejectActiveRosterIds = options.rejectActiveRosterIds ?? [];
   const need = 4 - mustIncludeIds.length;
   if (need < 0 || need > fillFromIds.length) return null;
 
@@ -343,6 +348,13 @@ export function pickLineupWithMustInclude(
     const ranked = findBalancedTeams(mustInclude, 1, false, sessionId);
     const top = ranked[0];
     if (!top) return null;
+    const ids = [...top.team1, ...top.team2].map(p => p.id);
+    if (
+      hasPlayedFourPlayerSet(sessionId, ids) ||
+      (rejectActiveRosterIds.length === 4 && isSameFourPlayerSet(ids, rejectActiveRosterIds))
+    ) {
+      return null;
+    }
     return {
       team1Ids: top.team1.map(p => p.id),
       team2Ids: top.team2.map(p => p.id),
@@ -372,6 +384,7 @@ export function pickLineupWithMustInclude(
   pick(0, []);
 
   let best: { team1Ids: string[]; team2Ids: string[]; skillGap: number; splitPenalty: number; variance: number } | null = null;
+  let bestRepeat: typeof best = null;
   for (const fillCombo of combos) {
     const four = [...mustInclude, ...fillCombo];
     const ranked = findBalancedTeams(four, 1, false, sessionId);
@@ -384,6 +397,22 @@ export function pickLineupWithMustInclude(
       splitPenalty: top.splitPenalty,
       variance: top.variance,
     };
+    const candidateIds = [...candidate.team1Ids, ...candidate.team2Ids];
+    const isRepeat =
+      hasPlayedFourPlayerSet(sessionId, candidateIds) ||
+      (rejectActiveRosterIds.length === 4 && isSameFourPlayerSet(candidateIds, rejectActiveRosterIds));
+    if (isRepeat) {
+      if (!bestRepeat) {
+        bestRepeat = candidate;
+      } else {
+        const beats =
+          candidate.skillGap < bestRepeat.skillGap - 0.01 ||
+          (Math.abs(candidate.skillGap - bestRepeat.skillGap) < 0.01 && candidate.splitPenalty < bestRepeat.splitPenalty) ||
+          (Math.abs(candidate.skillGap - bestRepeat.skillGap) < 0.01 && candidate.splitPenalty === bestRepeat.splitPenalty && candidate.variance < bestRepeat.variance);
+        if (beats) bestRepeat = candidate;
+      }
+      continue;
+    }
     if (!best) {
       best = candidate;
       continue;
@@ -395,8 +424,9 @@ export function pickLineupWithMustInclude(
     if (beats) best = candidate;
   }
 
-  if (!best) return null;
-  return { team1Ids: best.team1Ids, team2Ids: best.team2Ids };
+  const chosen = best ?? bestRepeat;
+  if (!chosen) return null;
+  return { team1Ids: chosen.team1Ids, team2Ids: chosen.team2Ids };
 }
 
 // ─── Look-ahead helpers (Task #65 — Balanced Queued Look-Ahead) ─────────────
@@ -482,12 +512,21 @@ export function pickLineupWithLookahead(
   const threshold = options.gapThreshold ?? UNBALANCED_GAP_THRESHOLD;
   const waitingSet = new Set([...mustIncludeIds, ...optionalWaitingIds]);
   const isActive = (id: string) => !waitingSet.has(id);
+  const borrowOptions = { rejectActiveRosterIds: activeRosterIds };
+
+  const isBlockedRepeat = (lineup: Lineup): boolean => {
+    const ids = [...lineup.team1Ids, ...lineup.team2Ids];
+    return (
+      hasPlayedFourPlayerSet(sessionId, ids) ||
+      (activeRosterIds.length === 4 && isSameFourPlayerSet(ids, activeRosterIds))
+    );
+  };
 
   // Plan A — pure waiting only.
-  const planA = pickLineupWithMustInclude(sessionId, mustIncludeIds, optionalWaitingIds, allPlayers);
+  const planA = pickLineupWithMustInclude(sessionId, mustIncludeIds, optionalWaitingIds, allPlayers, borrowOptions);
   const planAGap = planA ? computeLineupSkillGap(planA, allPlayers) : Infinity;
 
-  if (planA && planAGap < threshold) {
+  if (planA && planAGap < threshold && !isBlockedRepeat(planA)) {
     return { lineup: planA, includesActive: false, skillGap: planAGap };
   }
 
@@ -497,7 +536,7 @@ export function pickLineupWithLookahead(
   // Plan A — bail early to avoid wasted work.)
   if (mustIncludeIds.length < 4 && activeRosterIds.length > 0) {
     const fill = [...optionalWaitingIds, ...activeRosterIds];
-    const planB = pickLineupWithMustInclude(sessionId, mustIncludeIds, fill, allPlayers);
+    const planB = pickLineupWithMustInclude(sessionId, mustIncludeIds, fill, allPlayers, borrowOptions);
     if (planB) {
       const planBGap = computeLineupSkillGap(planB, allPlayers);
       const planBUsesActive =
@@ -505,13 +544,15 @@ export function pickLineupWithLookahead(
 
       // Take Plan B when it strictly beats Plan A (or Plan A doesn't exist).
       // The 0.01 epsilon matches pickLineupWithMustInclude's tie-break.
-      if (!planA || planBGap < planAGap - 0.01) {
+      if ((!planA || planBGap < planAGap - 0.01) && !isBlockedRepeat(planB)) {
         return { lineup: planB, includesActive: planBUsesActive, skillGap: planBGap };
       }
     }
   }
 
-  if (planA) return { lineup: planA, includesActive: false, skillGap: planAGap };
+  if (planA && !isBlockedRepeat(planA)) {
+    return { lineup: planA, includesActive: false, skillGap: planAGap };
+  }
   return null;
 }
 
@@ -536,6 +577,7 @@ export async function tryAutoMatchmaking(sessionId: string): Promise<void> {
       const queue = await storage.getQueue(sessionId);
       buildRestStatesFromHistory(sessionId, history, queue);
       buildPartnerHistoryFromHistory(sessionId, history);
+      buildFourPlayerHistoryFromHistory(sessionId, history);
 
       const allPlayers = await storage.getAllPlayers();
 
@@ -1074,6 +1116,19 @@ async function tryClaudeQueuedBatch(
       continue;
     }
 
+    const all4Ids = [...all4];
+    const activeIds = activeRosterByCourtId.get(court.id) ?? [];
+    if (
+      hasPlayedFourPlayerSet(sessionId, all4Ids) ||
+      (activeIds.length === 4 && isSameFourPlayerSet(all4Ids, activeIds))
+    ) {
+      console.log(
+        `[queued-orchestrator] session=${sessionId} court=${court.id} ` +
+        `Claude row rejected — repeats same-session or on-court quartet`,
+      );
+      continue;
+    }
+
     // includesActivePlayers = true when the lineup pulls in any player who
     // wasn't in the waiting pool at orchestrator-time. The game-end
     // transition's re-verify (tryFlipQueuedToPendingForCourt) uses this
@@ -1128,6 +1183,17 @@ export async function tryFlipQueuedToPendingForCourt(
   if (!queued) return { flippedId: null, dismissedId: null };
 
   const namedIds = queued.players.map(p => p.playerId);
+
+  // Never promote a queued row that repeats a quartet already played this
+  // session (common when a mid-game borrowed lineup named the court's
+  // active roster as "up next"). Dismiss so tryAutoMatchmaking rebuilds.
+  if (hasPlayedFourPlayerSet(sessionId, namedIds)) {
+    await storage.dismissQueuedSuggestion(queued.id);
+    console.log(
+      `[queued-transition] session=${sessionId} court=${courtId} queued=${queued.id} dismissed — repeats same-session four-player matchup`,
+    );
+    return { flippedId: null, dismissedId: queued.id };
+  }
 
   // Branch on includesActivePlayers (per spec):
   //  • false (Case 1 — pure waiting pool): the named players were

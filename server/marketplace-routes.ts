@@ -44,6 +44,7 @@ import {
   buildPartnerHistoryFromHistory,
   updatePlayerRestState,
   updatePartnerHistory,
+  updateFourPlayerHistory,
   persistRestStatesToDb,
 } from "./matchmaking";
 import { tryAutoMatchmaking, tryFlipQueuedToPendingForCourt } from "./auto-matchmaking";
@@ -4994,6 +4995,7 @@ export function registerMarketplaceRoutes(app: Express) {
         const team1Players = team1Ids.map(id => ({ id }));
         const team2Players = team2Ids.map(id => ({ id }));
         updatePartnerHistory(session.id, team1Players, team2Players);
+        updateFourPlayerHistory(session.id, playerIds);
 
         const currentQueue = await storage.getQueue(session.id);
         const playedSet = new Set(playerIds);

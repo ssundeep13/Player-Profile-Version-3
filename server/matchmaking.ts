@@ -101,6 +101,10 @@ const sessionRestStates = new Map<string, Map<string, PlayerRestState>>();
 // Fix 3: Partner history: sessionId → "lowerId:higherId" → times played together
 const sessionPartnerHistory = new Map<string, Map<string, number>>();
 
+// Same-session four-player sets (order-independent) → times this exact
+// quartet has already played a game together.
+const sessionFourPlayerHistory = new Map<string, Map<string, number>>();
+
 // Voluntary sit-out: sessionId → Set of player IDs currently sitting out
 const sessionSittingOut = new Map<string, Set<string>>();
 
@@ -195,6 +199,7 @@ export function clearPlayerRestState(sessionId: string, playerId: string): void 
 export function clearSessionRestStates(sessionId: string): void {
   sessionRestStates.delete(sessionId);
   sessionPartnerHistory.delete(sessionId);
+  sessionFourPlayerHistory.delete(sessionId);
   sessionSittingOut.delete(sessionId);
 }
 
@@ -358,6 +363,61 @@ export function buildPartnerHistoryFromHistory(
   }
 
   sessionPartnerHistory.set(sessionId, history);
+}
+
+function fourPlayerKey(playerIds: string[]): string {
+  return [...playerIds].sort().join(':');
+}
+
+function getSessionFourPlayerHistory(sessionId: string): Map<string, number> {
+  if (!sessionFourPlayerHistory.has(sessionId)) {
+    sessionFourPlayerHistory.set(sessionId, new Map());
+  }
+  return sessionFourPlayerHistory.get(sessionId)!;
+}
+
+/** Record that this exact quartet has completed a game in the session. */
+export function updateFourPlayerHistory(sessionId: string, playerIds: string[]): void {
+  if (playerIds.length !== 4) return;
+  const history = getSessionFourPlayerHistory(sessionId);
+  const key = fourPlayerKey(playerIds);
+  history.set(key, (history.get(key) ?? 0) + 1);
+}
+
+/** Rebuild four-player history from completed games (idempotent). */
+export function buildFourPlayerHistoryFromHistory(
+  sessionId: string,
+  gameParticipants: (GameParticipant & { createdAt: Date })[],
+): void {
+  const history = new Map<string, number>();
+
+  const gameGroups = new Map<string, typeof gameParticipants>();
+  for (const p of gameParticipants) {
+    if (!gameGroups.has(p.gameId)) gameGroups.set(p.gameId, []);
+    gameGroups.get(p.gameId)!.push(p);
+  }
+
+  for (const participants of gameGroups.values()) {
+    if (participants.length !== 4) continue;
+    const key = fourPlayerKey(participants.map(p => p.playerId));
+    history.set(key, (history.get(key) ?? 0) + 1);
+  }
+
+  sessionFourPlayerHistory.set(sessionId, history);
+}
+
+/** True when these four players have already played together this session. */
+export function hasPlayedFourPlayerSet(sessionId: string, playerIds: string[]): boolean {
+  if (playerIds.length !== 4) return false;
+  const history = getSessionFourPlayerHistory(sessionId);
+  return (history.get(fourPlayerKey(playerIds)) ?? 0) > 0;
+}
+
+/** True when two quartets contain the same four player ids (any team split). */
+export function isSameFourPlayerSet(a: string[], b: string[]): boolean {
+  if (a.length !== 4 || b.length !== 4) return false;
+  const set = new Set(a);
+  return b.every(id => set.has(id));
 }
 
 /**

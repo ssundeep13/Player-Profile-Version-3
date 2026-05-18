@@ -40,6 +40,7 @@ import {
   generateBracketedLineups,
   updatePlayerRestState,
   updatePartnerHistory,
+  updateFourPlayerHistory,
   clearPlayerRestState,
   clearSessionRestStates,
   toggleSittingOut,
@@ -2327,7 +2328,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       // Fix 3: Record partner pairings for split-penalty calculation
       updatePartnerHistory(activeSession.id, team1, team2);
-      
+      updateFourPlayerHistory(activeSession.id, participantData.map(p => p.playerId));
+
       // Update rest states for players who were waiting (reset their consecutive count)
       const currentQueue = await storage.getQueue(activeSession.id);
       const playedPlayerIds = new Set(participantData.map(p => p.playerId));
