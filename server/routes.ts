@@ -2499,21 +2499,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
         sessionId = activeSession.id;
       }
 
-      const courts = await storage.getCourtsBySession(sessionId);
+      const courtsWithPlayers = await storage.getCourtsWithPlayers(sessionId);
       const queue = await storage.getQueue(sessionId);
-      
-      // Get session-specific players (those in the queue for this session)
-      // Note: queue is already an array of player IDs
+
+      // Players on in-play courts (marketplace start-game and admin assign both
+      // set courts.status to 'occupied' and write court_players). Do NOT use
+      // players.status='playing' intersected with the queue — start-game removes
+      // the 4 starters from the queue, which made this counter read 0.
+      const inPlayCourts = courtsWithPlayers.filter(
+        (c) => c.status === 'occupied' || c.status === 'playing',
+      );
+      const activePlayers = inPlayCourts.reduce((sum, c) => sum + c.players.length, 0);
+
       const allPlayers = await storage.getAllPlayers();
       const sessionPlayers = allPlayers.filter(p => queue.includes(p.id));
 
       const stats = {
-        activePlayers: sessionPlayers.filter((p: any) => p.status === 'playing').length,
+        activePlayers,
         inQueue: queue.length,
-        availableCourts: courts.filter((c: any) => c.status === 'available').length,
-        occupiedCourts: courts.filter((c: any) => c.status === 'occupied').length,
+        availableCourts: courtsWithPlayers.filter((c) => c.status === 'available').length,
+        occupiedCourts: inPlayCourts.length,
         totalPlayers: sessionPlayers.length, // Session-specific count
-        totalCourts: courts.length,
+        totalCourts: courtsWithPlayers.length,
       };
 
       res.json(stats);
